@@ -27,7 +27,6 @@ constexpr int IME_M = 4;
 constexpr int IME_N = 4;
 constexpr int IME_K = 8;
 constexpr int IME_TILE_BYTES = IME_M * IME_K;
-constexpr uint64_t SIGN_FLIP_8 = 0x8080808080808080ull;
 constexpr int MAX_RVV_THREADS = 4;
 
 struct PackedMatrix {
@@ -232,10 +231,9 @@ static inline void pack_four_rows(const int8_t* rows[IME_M], int cols,
     for (int col_tile = 0; col_tile < col_tiles; ++col_tile) {
         uint8_t* tile = packed + (size_t)col_tile * IME_TILE_BYTES;
         for (int row = 0; row < IME_M; ++row) {
-            uint64_t value = SIGN_FLIP_8;
+            uint64_t value = 0;
             if (rows[row] != nullptr) {
                 std::memcpy(&value, rows[row] + col_tile * IME_K, IME_K);
-                value ^= SIGN_FLIP_8;
             }
             std::memcpy(tile + row * IME_K, &value, IME_K);
         }
@@ -260,8 +258,8 @@ static inline void ime_gate_up_4x4(const uint8_t* input,
         "vle8.v v0, (%[input])\n\t"
         "vle8.v v1, (%[gate])\n\t"
         "vle8.v v2, (%[up])\n\t"
-        ".word 0xe2101e2b\n\t"
-        ".word 0xe2201f2b\n\t"
+        ".word 0xe2103e2b\n\t"
+        ".word 0xe2203f2b\n\t"
         "addi %[input], %[input], 32\n\t"
         "addi %[gate], %[gate], 32\n\t"
         "addi %[up], %[up], 32\n\t"
@@ -289,7 +287,7 @@ static inline void ime_down_4x4(const uint8_t* input,
         "1:\n\t"
         "vle8.v v0, (%[input])\n\t"
         "vle8.v v1, (%[weight])\n\t"
-        ".word 0xe2101e2b\n\t"
+        ".word 0xe2103e2b\n\t"
         "addi %[input], %[input], 32\n\t"
         "addi %[weight], %[weight], 32\n\t"
         "addi %[tiles], %[tiles], -1\n\t"
@@ -329,12 +327,6 @@ static inline void run_expert_block(
         up_matrix.data + (size_t)matrix_index * up_matrix.matrix_bytes;
     const int8_t* down_base =
         down_matrix.data + (size_t)matrix_index * down_matrix.matrix_bytes;
-    const int32_t* gate_sums =
-        gate_matrix.row_sum + (size_t)matrix_index * d_ff;
-    const int32_t* up_sums =
-        up_matrix.row_sum + (size_t)matrix_index * d_ff;
-    const int32_t* down_sums =
-        down_matrix.row_sum + (size_t)matrix_index * d_model;
     const int input_tiles = d_model / IME_K;
     const int hidden_tiles = d_ff / IME_K;
     const size_t gate_block_stride = (size_t)input_tiles * IME_TILE_BYTES;
@@ -353,10 +345,8 @@ static inline void run_expert_block(
             for (int column = 0; column < IME_N; ++column) {
                 int hidden_index = output_block * IME_N + column;
                 int tile_index = row * IME_N + column;
-                int32_t gate_acc = scratch.gate_tile[tile_index] -
-                    128 * gate_sums[hidden_index];
-                int32_t up_acc = scratch.up_tile[tile_index] -
-                    128 * up_sums[hidden_index];
+                int32_t gate_acc = scratch.gate_tile[tile_index];
+                int32_t up_acc = scratch.up_tile[tile_index];
                 float gate_value =
                     (float)gate_acc * (input_scale * gate_scale);
                 float up_value =
@@ -409,8 +399,7 @@ static inline void run_expert_block(
             for (int column = 0; column < IME_N; ++column) {
                 int model_index = output_block * IME_N + column;
                 int32_t accumulator =
-                    scratch.down_tile[row * IME_N + column] -
-                    128 * down_sums[model_index];
+                    scratch.down_tile[row * IME_N + column];
                 output[model_index] += (float)accumulator * output_scale;
             }
         }
