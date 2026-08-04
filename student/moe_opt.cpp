@@ -9,11 +9,6 @@
 #include <cstring>
 #include <new>
 
-#if defined(MOE_PROFILE)
-#include <cstdio>
-#include <ctime>
-#endif
-
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
@@ -31,7 +26,6 @@ constexpr int MAX_RVV_THREADS = 4;
 
 struct PackedMatrix {
     int8_t* data = nullptr;
-    int32_t* row_sum = nullptr;
     int rows = 0;
     int cols = 0;
     size_t matrix_bytes = 0;
@@ -51,6 +45,9 @@ static float g_topk_weight[MAX_NUM_TOKENS][MAX_TOP_K];
 static int g_expert_count[MAX_NUM_EXPERTS];
 static int g_expert_tokens[MAX_NUM_EXPERTS][MAX_NUM_TOKENS];
 static float g_expert_weights[MAX_NUM_EXPERTS][MAX_NUM_TOKENS];
+static int g_expert_slots[MAX_NUM_EXPERTS][MAX_NUM_TOKENS];
+alignas(64) static float
+    g_routed_output[MAX_NUM_TOKENS][MAX_TOP_K][MAX_D_MODEL];
 
 alignas(64) static float
     g_thread_output[MAX_RVV_THREADS][MAX_NUM_TOKENS][MAX_D_MODEL];
@@ -67,18 +64,6 @@ struct ExpertScratch {
 
 static thread_local ExpertScratch g_scratch;
 
-#if defined(MOE_PROFILE)
-static inline uint64_t read_cycle() {
-    timespec value;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &value);
-    return (uint64_t)value.tv_sec * 1000000000ull + (uint64_t)value.tv_nsec;
-}
-static uint64_t g_profile_pack = 0;
-static uint64_t g_profile_gate = 0;
-static uint64_t g_profile_quant = 0;
-static uint64_t g_profile_down = 0;
-#endif
-
 static inline int rvv_thread_count() {
 #if defined(_OPENMP)
     return std::min(MAX_RVV_THREADS, std::max(1, omp_get_num_procs()));
@@ -93,19 +78,12 @@ static void pack_matrix(PackedMatrix& packed, const int8_t* source, int count,
     packed.cols = cols;
     packed.matrix_bytes = (size_t)rows * cols;
     packed.data = new int8_t[(size_t)count * packed.matrix_bytes];
-    packed.row_sum = new int32_t[(size_t)count * rows];
 
     const int col_tiles = cols / IME_K;
 #pragma omp parallel for schedule(static) if (count > 1)
     for (int matrix = 0; matrix < count; ++matrix) {
         const int8_t* src = source + (size_t)matrix * rows * cols;
         int8_t* dst = packed.data + (size_t)matrix * rows * cols;
-        int32_t* sums = packed.row_sum + (size_t)matrix * rows;
-        for (int row = 0; row < rows; ++row) {
-            int32_t sum = 0;
-            for (int col = 0; col < cols; ++col) sum += src[(size_t)row * cols + col];
-            sums[row] = sum;
-        }
         for (int row_block = 0; row_block < rows / IME_N; ++row_block) {
             for (int col_tile = 0; col_tile < col_tiles; ++col_tile) {
                 int8_t* tile = dst +
@@ -263,7 +241,31 @@ static inline void ime_gate_up_4x4(const uint8_t* input,
         "addi %[input], %[input], 32\n\t"
         "addi %[gate], %[gate], 32\n\t"
         "addi %[up], %[up], 32\n\t"
-        "addi %[tiles], %[tiles], -1\n\t"
+        "vle8.v v0, (%[input])\n\t"
+        "vle8.v v1, (%[gate])\n\t"
+        "vle8.v v2, (%[up])\n\t"
+        ".word 0xe2103e2b\n\t"
+        ".word 0xe2203f2b\n\t"
+        "addi %[input], %[input], 32\n\t"
+        "addi %[gate], %[gate], 32\n\t"
+        "addi %[up], %[up], 32\n\t"
+        "vle8.v v0, (%[input])\n\t"
+        "vle8.v v1, (%[gate])\n\t"
+        "vle8.v v2, (%[up])\n\t"
+        ".word 0xe2103e2b\n\t"
+        ".word 0xe2203f2b\n\t"
+        "addi %[input], %[input], 32\n\t"
+        "addi %[gate], %[gate], 32\n\t"
+        "addi %[up], %[up], 32\n\t"
+        "vle8.v v0, (%[input])\n\t"
+        "vle8.v v1, (%[gate])\n\t"
+        "vle8.v v2, (%[up])\n\t"
+        ".word 0xe2103e2b\n\t"
+        ".word 0xe2203f2b\n\t"
+        "addi %[input], %[input], 32\n\t"
+        "addi %[gate], %[gate], 32\n\t"
+        "addi %[up], %[up], 32\n\t"
+        "addi %[tiles], %[tiles], -4\n\t"
         "bnez %[tiles], 1b\n\t"
         "vsetvli t0, zero, e32, m2, ta, ma\n\t"
         "vse32.v v28, (%[gate_output])\n\t"
@@ -290,7 +292,22 @@ static inline void ime_down_4x4(const uint8_t* input,
         ".word 0xe2103e2b\n\t"
         "addi %[input], %[input], 32\n\t"
         "addi %[weight], %[weight], 32\n\t"
-        "addi %[tiles], %[tiles], -1\n\t"
+        "vle8.v v0, (%[input])\n\t"
+        "vle8.v v1, (%[weight])\n\t"
+        ".word 0xe2103e2b\n\t"
+        "addi %[input], %[input], 32\n\t"
+        "addi %[weight], %[weight], 32\n\t"
+        "vle8.v v0, (%[input])\n\t"
+        "vle8.v v1, (%[weight])\n\t"
+        ".word 0xe2103e2b\n\t"
+        "addi %[input], %[input], 32\n\t"
+        "addi %[weight], %[weight], 32\n\t"
+        "vle8.v v0, (%[input])\n\t"
+        "vle8.v v1, (%[weight])\n\t"
+        ".word 0xe2103e2b\n\t"
+        "addi %[input], %[input], 32\n\t"
+        "addi %[weight], %[weight], 32\n\t"
+        "addi %[tiles], %[tiles], -4\n\t"
         "bnez %[tiles], 1b\n\t"
         "vsetvli t0, zero, e32, m2, ta, ma\n\t"
         "vse32.v v28, (%[output])\n\t"
@@ -304,8 +321,8 @@ static inline void run_expert_block(
     const PackedMatrix& gate_matrix, const PackedMatrix& up_matrix,
     const PackedMatrix& down_matrix, int matrix_index, float gate_scale,
     float up_scale, float down_scale, const int token_indices[IME_M],
-    const float combine_weight[IME_M], float* destination, int num_tokens,
-    int d_model, int d_ff) {
+    const float combine_weight[IME_M], const int output_slots[IME_M],
+    float* destination, int num_tokens, int d_model, int d_ff) {
     ExpertScratch& scratch = g_scratch;
     const int8_t* input_rows[IME_M];
     for (int row = 0; row < IME_M; ++row) {
@@ -313,13 +330,7 @@ static inline void run_expert_block(
             ? g_xq[token_indices[row]]
             : nullptr;
     }
-#if defined(MOE_PROFILE)
-    uint64_t profile_pack_start = read_cycle();
-#endif
     pack_four_rows(input_rows, d_model, scratch.input_pack);
-#if defined(MOE_PROFILE)
-    uint64_t profile_gate_start = read_cycle();
-#endif
 
     const int8_t* gate_base =
         gate_matrix.data + (size_t)matrix_index * gate_matrix.matrix_bytes;
@@ -360,9 +371,6 @@ static inline void run_expert_block(
         }
     }
 
-#if defined(MOE_PROFILE)
-    uint64_t profile_quant_start = read_cycle();
-#endif
     float hidden_scale[IME_M];
     const int8_t* hidden_rows[IME_M];
     for (int row = 0; row < IME_M; ++row) {
@@ -382,9 +390,6 @@ static inline void run_expert_block(
     }
     pack_four_rows(hidden_rows, d_ff, scratch.hidden_pack);
 
-#if defined(MOE_PROFILE)
-    uint64_t profile_down_start = read_cycle();
-#endif
     for (int output_block = 0; output_block < d_model / IME_N;
          ++output_block) {
         ime_down_4x4(scratch.hidden_pack,
@@ -395,26 +400,22 @@ static inline void run_expert_block(
             if (token_index < 0) continue;
             float output_scale = hidden_scale[row] * down_scale *
                 combine_weight[row];
-            float* output = destination + (size_t)token_index * d_model;
+            float* output = output_slots != nullptr
+                ? g_routed_output[token_index][output_slots[row]]
+                : destination + (size_t)token_index * d_model;
             for (int column = 0; column < IME_N; ++column) {
                 int model_index = output_block * IME_N + column;
                 int32_t accumulator =
                     scratch.down_tile[row * IME_N + column];
-                output[model_index] += (float)accumulator * output_scale;
+                float value = (float)accumulator * output_scale;
+                if (output_slots != nullptr) {
+                    output[model_index] = value;
+                } else {
+                    output[model_index] += value;
+                }
             }
         }
     }
-#if defined(MOE_PROFILE)
-    uint64_t profile_end = read_cycle();
-    __atomic_fetch_add(&g_profile_pack, profile_gate_start - profile_pack_start,
-                       __ATOMIC_RELAXED);
-    __atomic_fetch_add(&g_profile_gate, profile_quant_start - profile_gate_start,
-                       __ATOMIC_RELAXED);
-    __atomic_fetch_add(&g_profile_quant, profile_down_start - profile_quant_start,
-                       __ATOMIC_RELAXED);
-    __atomic_fetch_add(&g_profile_down, profile_end - profile_down_start,
-                       __ATOMIC_RELAXED);
-#endif
     (void)num_tokens;
 }
 
@@ -433,7 +434,7 @@ static void compute_shared_expert(const MoEWeights& w, float* y,
         }
         run_expert_block(g_shared_gate, g_shared_up, g_shared_down, 0,
                          w.sh_s_gate, w.sh_s_up, w.sh_s_down, tokens, weights,
-                         y, num_tokens, w.d_model, w.d_ff);
+                         nullptr, y, num_tokens, w.d_model, w.d_ff);
     }
 }
 
@@ -446,12 +447,37 @@ static void dispatch_tokens(const MoEWeights& w, int num_tokens) {
             int position = g_expert_count[expert]++;
             g_expert_tokens[expert][position] = token;
             g_expert_weights[expert][position] = g_topk_weight[token][slot];
+            g_expert_slots[expert][position] = slot;
         }
     }
 }
 
 static void compute_routed_experts(const MoEWeights& w, float* y,
                                    int num_tokens) {
+    if (num_tokens == 1 && w.top_k > 1) {
+        const int threads = rvv_thread_count();
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+        for (int expert = 0; expert < w.num_experts; ++expert) {
+            if (g_expert_count[expert] == 0) continue;
+            int tokens[IME_M] = {g_expert_tokens[expert][0], -1, -1, -1};
+            float weights[IME_M] = {g_expert_weights[expert][0], 0.0f, 0.0f,
+                                         0.0f};
+            int slots[IME_M] = {g_expert_slots[expert][0], 0, 0, 0};
+            run_expert_block(g_gate, g_up, g_down, expert,
+                             w.s_gate[expert], w.s_up[expert],
+                             w.s_down[expert], tokens, weights, slots, nullptr,
+                             num_tokens, w.d_model, w.d_ff);
+        }
+        for (int model = 0; model < w.d_model; ++model) {
+            float sum = 0.0f;
+            for (int slot = 0; slot < w.top_k; ++slot) {
+                sum += g_routed_output[0][slot][model];
+            }
+            y[model] += sum;
+        }
+        return;
+    }
+
     const int threads = num_tokens >= 32 ? rvv_thread_count() : 1;
     const size_t output_elements = (size_t)num_tokens * w.d_model;
     if (threads == 1) {
@@ -471,7 +497,7 @@ static void compute_routed_experts(const MoEWeights& w, float* y,
                 }
                 run_expert_block(g_gate, g_up, g_down, expert,
                                  w.s_gate[expert], w.s_up[expert],
-                                 w.s_down[expert], tokens, weights, y,
+                                 w.s_down[expert], tokens, weights, nullptr, y,
                                  num_tokens, w.d_model, w.d_ff);
             }
         }
@@ -504,7 +530,8 @@ static void compute_routed_experts(const MoEWeights& w, float* y,
                 run_expert_block(g_gate, g_up, g_down, expert,
                                  w.s_gate[expert], w.s_up[expert],
                                  w.s_down[expert], tokens, weights,
-                                 thread_output, num_tokens, w.d_model, w.d_ff);
+                                 nullptr, thread_output, num_tokens, w.d_model,
+                                 w.d_ff);
             }
         }
     }
@@ -536,9 +563,6 @@ void preprocess(MoEWeights& w) {
 
 void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                            int num_tokens) {
-#if defined(MOE_PROFILE)
-    uint64_t profile_start = read_cycle();
-#endif
     const int threads = rvv_thread_count();
 #pragma omp parallel for schedule(static) if (num_tokens >= 32) num_threads(threads)
     for (int token = 0; token < num_tokens; ++token) {
@@ -549,43 +573,9 @@ void moe_forward_optimized(const float* x, const MoEWeights& w, float* y,
                     (size_t)w.d_model * sizeof(float));
     }
 
-#if defined(MOE_PROFILE)
-    uint64_t profile_routing = read_cycle();
-#endif
     compute_shared_expert(w, y, num_tokens);
-#if defined(MOE_PROFILE)
-    uint64_t profile_shared = read_cycle();
-#endif
     dispatch_tokens(w, num_tokens);
-#if defined(MOE_PROFILE)
-    uint64_t profile_dispatch = read_cycle();
-#endif
     compute_routed_experts(w, y, num_tokens);
-#if defined(MOE_PROFILE)
-    uint64_t profile_end = read_cycle();
-    static uint64_t routing_cycles = 0;
-    static uint64_t shared_cycles = 0;
-    static uint64_t dispatch_cycles = 0;
-    static uint64_t routed_cycles = 0;
-    static int calls = 0;
-    routing_cycles += profile_routing - profile_start;
-    shared_cycles += profile_shared - profile_routing;
-    dispatch_cycles += profile_dispatch - profile_shared;
-    routed_cycles += profile_end - profile_dispatch;
-    if (++calls == 1000) {
-        std::fprintf(stderr,
-                     "PROFILE routing=%llu shared=%llu dispatch=%llu routed=%llu "
-                     "pack=%llu gate=%llu quant=%llu down=%llu\n",
-                     (unsigned long long)routing_cycles,
-                     (unsigned long long)shared_cycles,
-                     (unsigned long long)dispatch_cycles,
-                     (unsigned long long)routed_cycles,
-                     (unsigned long long)g_profile_pack,
-                     (unsigned long long)g_profile_gate,
-                     (unsigned long long)g_profile_quant,
-                     (unsigned long long)g_profile_down);
-    }
-#endif
 }
 
 #else
