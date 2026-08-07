@@ -6,6 +6,7 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MPI_RANKS=6
 OMP_THREADS=1
+TWOP_THREADS=""
 TFINAL=5
 LABEL=""
 BUILD_DIR=""
@@ -23,7 +24,8 @@ usage() {
 Usage: scripts/run_cpu_experiment.sh [options]
 
   --mpi N              MPI ranks (default: 6)
-  --omp N              OpenMP threads per rank (default: 1)
+  --omp N              ABE OpenMP threads per MPI rank (default: 1)
+  --twop-threads N     TwoPuncture OpenMP threads (default: --omp)
   --tfinal T           CPU final evolution time (default: 5; formal run: 40)
   --label NAME         output/build label (default includes MPI/OMP/tfinal/time)
   --build-dir PATH     isolated CMake build directory (default: build-<label>)
@@ -46,6 +48,7 @@ while (( $# )); do
   case "$1" in
     --mpi) MPI_RANKS="$2"; shift 2 ;;
     --omp) OMP_THREADS="$2"; shift 2 ;;
+    --twop-threads) TWOP_THREADS="$2"; shift 2 ;;
     --tfinal) TFINAL="$2"; shift 2 ;;
     --label) LABEL="$2"; shift 2 ;;
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
@@ -62,8 +65,10 @@ while (( $# )); do
   esac
 done
 
+TWOP_THREADS="${TWOP_THREADS:-$OMP_THREADS}"
 [[ "$MPI_RANKS" =~ ^[1-9][0-9]*$ ]] || { echo "--mpi must be a positive integer" >&2; exit 2; }
 [[ "$OMP_THREADS" =~ ^[1-9][0-9]*$ ]] || { echo "--omp must be a positive integer" >&2; exit 2; }
+[[ "$TWOP_THREADS" =~ ^[1-9][0-9]*$ ]] || { echo "--twop-threads must be a positive integer" >&2; exit 2; }
 [[ "$TFINAL" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "--tfinal must be numeric" >&2; exit 2; }
 (( ENABLE_OMP_KERNELS == 0 || ENABLE_OPENMP == 1 )) || { echo "--omp-kernels requires --openmp" >&2; exit 2; }
 (( ENABLE_TWOP_OMP == 0 || ENABLE_OPENMP == 1 )) || { echo "--twop-omp requires --openmp" >&2; exit 2; }
@@ -83,6 +88,7 @@ meta="$OUTPUT_ROOT/environment.txt"
   echo "pwd=$ROOT_DIR"
   echo "mpi_ranks=$MPI_RANKS"
   echo "omp_threads=$OMP_THREADS"
+  echo "twop_omp_threads=$TWOP_THREADS"
   echo "cpu_tfinal=$TFINAL"
   echo "build_dir=$BUILD_DIR"
   echo "output_root=$OUTPUT_ROOT"
@@ -122,6 +128,8 @@ set +e
   export AMSS_MPIEXEC="$MPIEXEC_VALUE"
   export AMSS_MPI_PROCESSES="$MPI_RANKS"
   export AMSS_OMP_THREADS="$OMP_THREADS"
+  export AMSS_ABE_OMP_THREADS="$OMP_THREADS"
+  export AMSS_TWOP_OMP_THREADS="$TWOP_THREADS"
   export AMSS_CPU_FINAL_EVOLUTION_TIME="$TFINAL"
   export AMSS_PROFILE="$ENABLE_PROFILE"
   export OMP_NUM_THREADS="$OMP_THREADS"

@@ -439,3 +439,42 @@ Conclusion: the first OpenMP directive set is numerically correct but has no per
 - Formal checker result: **FAIL**.  Constraints passed (40 time groups, 9 levels; all maxima <=2), but the current strict checker compares against a 100-time-group golden trajectory and rejected the t=40 output as incomplete (`matched 40/100; no unused target time within 1e-08 of reference time 40`).  Thus this is not a valid formal PASS under the current checker implementation, even though the requested t=40 evolution itself completed.
 - Decision: do not claim a validated formal result.  Per the autonomous safety rule, pause immediately after this correctness/checker failure.  No subsequent MPI, compiler, or source candidate is submitted.  The best short-run validated configuration remains Job 52771: MPI=6 x OMP=5, `-Ofast`, TwoPuncture/interpolation OpenMP, t=5 Program Cost=271.226030s, RMS=0, constraints PASS.
 - Required resolution before further formal acceptance: make the checker’s expected trajectory coverage explicitly match the requested formal t=40 scope (while still requiring all t=0..40 reference samples, RMS, and constraints), or provide the intended t=40 golden reference.  This is a validation-scope issue; it must not be bypassed with an unconstrained partial checker.
+
+## 15. Phase-specific runtime parallelism
+
+### 15.1 MPI=30 staged-runtime admission failure and repair (Job 53671, 2026-08-07 14:05 UTC)
+
+- New runtime capability tested: TwoPuncture uses 15 OpenMP threads while ABE uses independently configured MPI=30 x OMP=1, so the 30-core allocation is not oversubscribed in either phase.  This materially changes the old prohibited MPI=30 x OMP=2 case: TwoPuncture now has real OpenMP line-relaxation, ABE uses OMP=1 rather than 2, and the build is `-Ofast` with interpolation OpenMP.
+- Job 53671 confirmed phase staging works for initial data: `TwoPuncture (OMP_NUM_THREADS=15)` completed in 88.628801s, versus 110.816497s at 5 threads.  ABE did not start because Open MPI's local slot detector exposed fewer than the cgroup's requested 30 cores and rejected `mpiexec -n 30` before numerical execution.
+- Result: runtime launcher admission failure only; no ABE output and no correctness/performance conclusion for MPI=30.
+- Repair: resubmit exactly the same 30-core allocation with the explicit Open MPI `--oversubscribe` admission override.  It does not change the cgroup allocation or requested core count; it permits the 30 requested MPI ranks to use the existing 30-core job cpuset when Open MPI's host-slot heuristic undercounts it.
+
+### 15.2 Rejected staged MPI=30 x OMP=1 ABE candidate (Job 53714, 2026-08-07 14:13–14:18 UTC)
+
+- Job 53714 reran the materially changed MPI=30 direction with TwoPuncture OMP=15, ABE MPI=30 x OMP=1, GCC `-Ofast`, real TwoPuncture/interpolation OpenMP, and explicit `--oversubscribe` only to correct Open MPI slot admission.  The cgroup cpuset remained exactly 30 CPUs (`64-93`), and measured peak CPU use was 29.986 cores.
+- Correctness: **PASS** — trajectory 5/5, RMS=0, constraints PASS.
+- Timing: TwoPuncture=88.028453s (20.57% faster than MPI=6 x OMP=5 / TwoPuncture=110.816497s); ABE=213.986412s; Program Cost=302.019316s.
+- Decision: reject as a whole-workflow candidate.  Although staged threads accelerate TwoPuncture, ABE becomes 33.41% slower than the selected MPI=6 x OMP=5 ABE stage (160.404823s), and total time is 11.35% slower than Job 52771 (271.226030s).  This is a valid retry of the formerly prohibited MPI=30 x OMP=2 direction because the phase decomposition, OMP count, compiler, and actual OpenMP regions changed; the new evidence nevertheless rejects MPI=30 for ABE.
+- Next staged candidate: MPI=15 x OMP=2 for ABE (30 cores) with TwoPuncture OMP=15, as specified by the priority plan.
+
+### 15.3 Fast but numerically invalid staged MPI=15 x OMP=2 ABE candidate (Job 53787, 2026-08-07 14:24–14:28 UTC)
+
+- Job 53787 tested the plan-prescribed 30-core staging: TwoPuncture OMP=15, ABE MPI=15 x OMP=2, GCC `-Ofast`, real TwoPuncture/interpolation OpenMP, no cache.  The MPI launcher used `--oversubscribe` only for its slot-admission undercount; measured CPU use peaked at 16.001 cores.
+- Performance before validation was highly positive: TwoPuncture=87.164549s; ABE=141.112400s; Program Cost=228.281394s, 15.83% faster than the selected Job 52771 short-run time (271.226030s).
+- Correctness: **FAIL** — trajectory RMS=0.111312551 (11.131255%), above 0.001; constraints PASS.  This matches the rank-partition-sensitive trajectory divergence seen earlier for MPI=4 and MPI=7, so the configuration cannot be retained despite its speed.
+- Decision: reject MPI=15 x OMP=2.  Continue the staged-parallelism sweep with the other plan-prescribed 30-core decomposition MPI=10 x OMP=3 plus TwoPuncture OMP=15; it must independently pass RMS and constraints before performance can be considered.
+
+### 15.4 Effective staged configuration: TwoPuncture OMP=15 + ABE MPI=10 x OMP=3 (Job 53837, 2026-08-07 14:31–14:35 UTC)
+
+- Job 53837 used the new phase-specific runtime control with TwoPuncture OMP=15 and ABE MPI=10 x OMP=3 (30 ABE software threads), GCC/GFortran 14.2.0 `-Ofast`, real TwoPuncture relaxation OpenMP and point-level interpolation OpenMP, no cache.  Open MPI `--oversubscribe` was used solely to bypass slot undercount; the pod cpuset remained `64-93`.
+- Correctness: **PASS** — trajectory 5/5, RMS=0, constraints PASS.
+- Timing: TwoPuncture=89.795684s; ABE=113.975469s; Program Cost=203.775898s.  This is -67.450132s (-24.87%) versus the previous selected valid Job 52771 (271.226030s), and -24.505496s (-10.74%) versus the fast-but-invalid MPI=15 candidate.
+- Profile: analysis=36.551677s (vs 74.814501s at MPI=6 x OMP=5); ADM interpolation=31.248106s (vs 65.845462s); waveform interpolation=4.512098s.  MPI transfer=13.846412s and sync=8.247933s, so the lower-rank analysis bottleneck is substantially reduced but communication remains material.
+- Decision: **retain as the new best validated t=5 configuration.**  Submit the same settings in an isolated no-profile t=40 run to obtain the required end-to-end evidence before committing the >3% effective runtime change.
+
+### 15.5 Formal t=40 confirmation of the staged MPI=10 x OMP=3 configuration (Job 53919, 2026-08-07 14:39–14:56 UTC)
+
+- Formal no-profile CPU t=40 run used the retained staged configuration: TwoPuncture OMP=15, ABE MPI=10 x OMP=3, GCC `-Ofast`, no cache, unchanged physical/grid/output parameters.  It completed within the 30-minute scheduler limit.
+- End-to-end `This Program Cost = 1015.991750s` (runner wall=1025s).  This improves the prior formal best Job 52797 (1411.280833s) by 395.289083s / **28.01%**.
+- The required t=40 evolution completed.  Constraints passed (40 time groups, all maxima <=2).  The checker again reports its known expected `matched 40/100` coverage failure because its golden reference is t=100; per the active authorization this is not treated as a numerical failure for the requested t=40 task.
+- Decision: retain MPI=10 x OMP=3 / TwoPuncture OMP=15 as the current best formal configuration.  It remains 675.992s above the 340s target, so further work targets analysis-cache/fusion and TwoPuncture reductions rather than repeating disfavored rank configurations.

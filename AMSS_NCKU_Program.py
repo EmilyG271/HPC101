@@ -121,8 +121,24 @@ for exe in (abe_built, twop_built):
         sys.exit(f" Missing executable: {exe}\n"
                  f" Build first:  cmake -B build -S .  &&  cmake --build build -j")
 
-## OpenMP threads per MPI rank (inherited by the mpirun child process)
-os.environ["OMP_NUM_THREADS"] = str(input_data.OMP_threads)
+# The initial-data solver is a standalone executable, whereas ABE is launched
+# with MPI. Permit their OpenMP counts to differ so a 30-core allocation can
+# use threads for TwoPuncture but ranks for ABE without oversubscribing either
+# phase. Defaults preserve the legacy single OMP_threads value.
+def _positive_env_int(name, default):
+    value = os.environ.get(name, str(default))
+    try:
+        parsed = int(value)
+    except ValueError:
+        sys.exit(f" {name} must be a positive integer, got {value!r}")
+    if parsed < 1:
+        sys.exit(f" {name} must be a positive integer, got {value!r}")
+    return parsed
+
+ABE_OMP_THREADS = _positive_env_int("AMSS_ABE_OMP_THREADS", input_data.OMP_threads)
+TWOP_OMP_THREADS = _positive_env_int("AMSS_TWOP_OMP_THREADS", ABE_OMP_THREADS)
+input_data.OMP_threads = ABE_OMP_THREADS
+print(f"==> Phase OpenMP threads: TwoPuncture={TWOP_OMP_THREADS}, ABE={ABE_OMP_THREADS}")
 
 ## TwoPuncture initial-data cache (opt-in, for fast debugging)
 TWOP_CACHE   = os.environ.get("AMSS_NCKU_TWOP_CACHE", "") == "1"
@@ -189,7 +205,8 @@ from scripts import makefile_and_run
 start_time = time.time()
 
 two_puncture_started = time.time()
-print("\n Initial data method: Ansorg-TwoPuncture\n")
+os.environ["OMP_NUM_THREADS"] = str(TWOP_OMP_THREADS)
+print(f"\n Initial data method: Ansorg-TwoPuncture (OMP_NUM_THREADS={TWOP_OMP_THREADS})\n")
 
 from scripts import generate_TwoPuncture_input
 generate_TwoPuncture_input.generate_AMSSNCKU_TwoPuncture_input()
@@ -249,6 +266,8 @@ shutil.copy2(os.path.join(File_directory, "AMSS-NCKU.input"),
 ## Run the ABE evolution
 
 abe_started = time.time()
+os.environ["OMP_NUM_THREADS"] = str(ABE_OMP_THREADS)
+print(f"\n ABE phase OMP_NUM_THREADS={ABE_OMP_THREADS}\n")
 try:
     os.chdir(output_directory)
     makefile_and_run.run_ABE()
