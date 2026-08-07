@@ -26,7 +26,45 @@ using namespace std;
 #include <complex.h>
 #endif
 
+
 #include "TwoPunctures.h"
+
+#ifdef AMSS_ENABLE_TWOP_PROFILE
+#include <chrono>
+namespace
+{
+  enum TPStage { TP_SOLVE, TP_NEWTON, TP_F_OF_V, TP_DERIVATIVES, TP_SET_MATRIX, TP_BICGSTAB, TP_J_TIMES_DV, TP_RELAX, TP_STAGE_COUNT };
+  const char *tp_stage_names[TP_STAGE_COUNT] = {"solve", "newton", "f_of_v", "derivatives_ab3", "set_matrix_jfd", "bicgstab", "j_times_dv", "relax"};
+  double tp_totals[TP_STAGE_COUNT] = {0.0};
+  unsigned long tp_calls[TP_STAGE_COUNT] = {0};
+  class TPScope
+  {
+  public:
+    explicit TPScope(TPStage stage) : stage_(stage), started_(std::chrono::steady_clock::now()), active_(true) {}
+    ~TPScope() { stop(); }
+    void stop()
+    {
+      if (!active_) return;
+      const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - started_;
+      tp_totals[stage_] += elapsed.count();
+      tp_calls[stage_] += 1;
+      active_ = false;
+    }
+  private:
+    TPStage stage_;
+    std::chrono::steady_clock::time_point started_;
+    bool active_;
+  };
+  void report_twop_profile()
+  {
+    for (int stage = 0; stage < TP_STAGE_COUNT; ++stage)
+      if (tp_calls[stage] != 0)
+        cout << " TWOP_PROFILE stage=" << tp_stage_names[stage]
+             << " total_s=" << fixed << setprecision(6) << tp_totals[stage]
+             << " calls=" << tp_calls[stage] << endl;
+  }
+}
+#endif
 
 TwoPunctures::TwoPunctures(double mp, double mm, double b,
                            double P_plusx, double P_plusy, double P_plusz,
@@ -70,6 +108,9 @@ TwoPunctures::~TwoPunctures()
 
 void TwoPunctures::Solve()
 {
+#ifdef AMSS_ENABLE_TWOP_PROFILE
+  TPScope tp_scope(TP_SOLVE);
+#endif
 
   double mp = par_m_plus;
   double mm = par_m_minus;
@@ -175,6 +216,10 @@ void TwoPunctures::Solve()
 
   target_M_plus = Mp_adm;
   target_M_minus = Mm_adm;
+#ifdef AMSS_ENABLE_TWOP_PROFILE
+  tp_scope.stop();
+  report_twop_profile();
+#endif
 }
 void TwoPunctures::Save(char *fname)
 {
@@ -1121,6 +1166,9 @@ void TwoPunctures::rx3_To_xyz(int nvar, double x, double r, double phi,
 /* --------------------------------------------------------------------------*/
 void TwoPunctures::Derivatives_AB3(int nvar, int n1, int n2, int n3, derivs v)
 {
+#ifdef AMSS_ENABLE_TWOP_PROFILE
+  TPScope tp_scope(TP_DERIVATIVES);
+#endif
   int i, j, k, ivar, N, *indx;
   double *p, *dp, *d2p, *q, *dq, *r, *dr;
 
@@ -1228,6 +1276,9 @@ void TwoPunctures::Derivatives_AB3(int nvar, int n1, int n2, int n3, derivs v)
 void TwoPunctures::Newton(int const nvar, int const n1, int const n2, int const n3,
                           derivs v, double const tol, int const itmax)
 {
+#ifdef AMSS_ENABLE_TWOP_PROFILE
+  TPScope tp_scope(TP_NEWTON);
+#endif
   int ntotal = n1 * n2 * n3 * nvar, ii, it;
   double *F, dmax, normres;
   derivs u, dv;
@@ -1281,6 +1332,9 @@ void TwoPunctures::Newton(int const nvar, int const n1, int const n2, int const 
 void TwoPunctures::F_of_v(int nvar, int n1, int n2, int n3, derivs v, double *F,
                           derivs u)
 {
+#ifdef AMSS_ENABLE_TWOP_PROFILE
+  TPScope tp_scope(TP_F_OF_V);
+#endif
   /*      Calculates the left hand sides of the non-linear equations F_m(v_n)=0*/
   /*      and the function u (u.d0[]) as well as its derivatives*/
   /*      (u.d1[], u.d2[], u.d3[], u.d11[], u.d12[], u.d13[], u.d22[], u.d23[], u.d33[])*/
@@ -1291,8 +1345,10 @@ void TwoPunctures::F_of_v(int nvar, int n1, int n2, int n3, derivs v, double *F,
   derivs U;
   double *sources;
 
+#ifndef AMSS_ENABLE_TWOP_OMP
   values = dvector(0, nvar - 1);
   allocate_derivs(&U, nvar);
+#endif
 
   sources = (double *)calloc(n1 * n2 * n3, sizeof(double));
   if (0)
@@ -1357,6 +1413,13 @@ void TwoPunctures::F_of_v(int nvar, int n1, int n2, int n3, derivs v, double *F,
     debugfile = fopen("res.dat", "w");
     assert(debugfile);
   }
+#ifdef AMSS_ENABLE_TWOP_OMP
+#pragma omp parallel private(values, U, j, k, ivar, indx, al, be, A, B, X, R, x, r, phi, y, z, Am1, psi, psi2, psi4, psi7, r_plus, r_minus)
+  {
+    values = dvector(0, nvar - 1);
+    allocate_derivs(&U, nvar);
+#pragma omp for schedule(static)
+#endif
   for (i = 0; i < n1; i++)
   {
     for (j = 0; j < n2; j++)
@@ -1444,13 +1507,20 @@ void TwoPunctures::F_of_v(int nvar, int n1, int n2, int n3, derivs v, double *F,
       }
     }
   }
+#ifdef AMSS_ENABLE_TWOP_OMP
+    free_dvector(values, 0, nvar - 1);
+    free_derivs(&U, nvar);
+  }
+#endif
   if (debugfile)
   {
     fclose(debugfile);
   }
   free(sources);
+#ifndef AMSS_ENABLE_TWOP_OMP
   free_dvector(values, 0, nvar - 1);
   free_derivs(&U, nvar);
+#endif
 }
 /* --------------------------------------------------------------------------*/
 double TwoPunctures::norm_inf(double const *F, int const ntotal)
@@ -1471,6 +1541,9 @@ int TwoPunctures::bicgstab(int const nvar, int const n1, int const n2, int const
                            derivs v, derivs dv, int const itmax, double const tol,
                            double *normres)
 {
+#ifdef AMSS_ENABLE_TWOP_PROFILE
+  TPScope tp_scope(TP_BICGSTAB);
+#endif
   int const output = 1;
   int ntotal = n1 * n2 * n3 * nvar, ii;
   double alpha = 0, beta = 0;
@@ -1761,6 +1834,9 @@ double TwoPunctures::BY_KKofxyz(double x, double y, double z)
 void TwoPunctures::SetMatrix_JFD(int nvar, int n1, int n2, int n3, derivs u,
                                  int *ncols, int **cols, double **Matrix)
 {
+#ifdef AMSS_ENABLE_TWOP_PROFILE
+  TPScope tp_scope(TP_SET_MATRIX);
+#endif
   int column, row, mcol;
   int i, i1, i_0, i_1, j, j1, j_0, j_1, k, k1, k_0, k_1, N1, N2, N3,
       ivar, ivar1, ntotal = nvar * n1 * n2 * n3;
@@ -1846,7 +1922,10 @@ void TwoPunctures::SetMatrix_JFD(int nvar, int n1, int n2, int n3, derivs u,
 }
 /* --------------------------------------------------------------------------*/
 void TwoPunctures::J_times_dv(int nvar, int n1, int n2, int n3, derivs dv, double *Jdv, derivs u)
-{ /*      Calculates the left hand sides of the non-linear equations F_m(v_n)=0*/
+{
+#ifdef AMSS_ENABLE_TWOP_PROFILE
+  TPScope tp_scope(TP_J_TIMES_DV);
+#endif /*      Calculates the left hand sides of the non-linear equations F_m(v_n)=0*/
   /*      and the function u (u.d0[]) as well as its derivatives*/
   /*      (u.d1[], u.d2[], u.d3[], u.d11[], u.d12[], u.d13[], u.d22[], u.d23[], u.d33[])*/
   /*      at interior points and at the boundaries "+/-"*/
@@ -1856,6 +1935,9 @@ void TwoPunctures::J_times_dv(int nvar, int n1, int n2, int n3, derivs dv, doubl
 
   Derivatives_AB3(nvar, n1, n2, n3, dv);
 
+#ifdef AMSS_ENABLE_TWOP_OMP
+#pragma omp parallel for private(j, k, ivar, indx, al, be, A, B, X, R, x, r, phi, y, z, Am1, values, dU, U) schedule(static)
+#endif
   for (i = 0; i < n1; i++)
   {
     values = dvector(0, nvar - 1);
@@ -1923,18 +2005,33 @@ void TwoPunctures::J_times_dv(int nvar, int n1, int n2, int n3, derivs dv, doubl
 void TwoPunctures::relax(double *dv, int const nvar, int const n1, int const n2, int const n3,
                          double const *rhs, int const *ncols, int **cols, double **JFD)
 {
+#ifdef AMSS_ENABLE_TWOP_PROFILE
+  TPScope tp_scope(TP_RELAX);
+#endif
   int i, j, k, n;
 
   for (k = 0; k < n3; k = k + 2)
   {
     for (n = 0; n < N_PlaneRelax; n++)
     {
+#ifdef AMSS_ENABLE_TWOP_OMP
+#pragma omp parallel for schedule(static)
+#endif
       for (i = 2; i < n1; i = i + 2)
         LineRelax_be(dv, i, k, nvar, n1, n2, n3, rhs, ncols, cols, JFD);
+#ifdef AMSS_ENABLE_TWOP_OMP
+#pragma omp parallel for schedule(static)
+#endif
       for (i = 1; i < n1; i = i + 2)
         LineRelax_be(dv, i, k, nvar, n1, n2, n3, rhs, ncols, cols, JFD);
+#ifdef AMSS_ENABLE_TWOP_OMP
+#pragma omp parallel for schedule(static)
+#endif
       for (j = 1; j < n2; j = j + 2)
         LineRelax_al(dv, j, k, nvar, n1, n2, n3, rhs, ncols, cols, JFD);
+#ifdef AMSS_ENABLE_TWOP_OMP
+#pragma omp parallel for schedule(static)
+#endif
       for (j = 0; j < n2; j = j + 2)
         LineRelax_al(dv, j, k, nvar, n1, n2, n3, rhs, ncols, cols, JFD);
     }
@@ -1943,18 +2040,31 @@ void TwoPunctures::relax(double *dv, int const nvar, int const n1, int const n2,
   {
     for (n = 0; n < N_PlaneRelax; n++)
     {
+#ifdef AMSS_ENABLE_TWOP_OMP
+#pragma omp parallel for schedule(static)
+#endif
       for (i = 0; i < n1; i = i + 2)
         LineRelax_be(dv, i, k, nvar, n1, n2, n3, rhs, ncols, cols, JFD);
+#ifdef AMSS_ENABLE_TWOP_OMP
+#pragma omp parallel for schedule(static)
+#endif
       for (i = 1; i < n1; i = i + 2)
         LineRelax_be(dv, i, k, nvar, n1, n2, n3, rhs, ncols, cols, JFD);
+#ifdef AMSS_ENABLE_TWOP_OMP
+#pragma omp parallel for schedule(static)
+#endif
       for (j = 1; j < n2; j = j + 2)
         LineRelax_al(dv, j, k, nvar, n1, n2, n3, rhs, ncols, cols, JFD);
+#ifdef AMSS_ENABLE_TWOP_OMP
+#pragma omp parallel for schedule(static)
+#endif
       for (j = 0; j < n2; j = j + 2)
         LineRelax_al(dv, j, k, nvar, n1, n2, n3, rhs, ncols, cols, JFD);
     }
   }
 }
 /* --------------------------------------------------------------------------*/
+
 void TwoPunctures::LineRelax_be(double *dv,
                                 int const i, int const k, int const nvar,
                                 int const n1, int const n2, int const n3,

@@ -10,6 +10,10 @@ using namespace std;
 
 #include <mpi.h>
 
+#ifdef AMSS_ENABLE_OPENMP
+#include <omp.h>
+#endif
+
 #include "misc.h"
 #include "macrodef.h"
 
@@ -35,6 +39,14 @@ int main(int argc, char *argv[])
       MPI_Init(&argc, &argv);
       MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
       MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
+
+#ifdef AMSS_ENABLE_OPENMP
+      if (myrank == 0)
+            cout << " AMSS OpenMP: enabled, OMP max threads/rank = " << omp_get_max_threads() << endl;
+#else
+      if (myrank == 0)
+            cout << " AMSS OpenMP: disabled (build without AMSS_ENABLE_OPENMP)" << endl;
+#endif
 
       double Begin_clock, End_clock;
       if (myrank == 0)

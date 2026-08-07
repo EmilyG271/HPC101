@@ -121,6 +121,37 @@ root if unset), and `GOLDEN_DIR` against the lab root. The shipped
 check a non-default run directory. See `python3 scripts/check_result.py --help`
 for details.
 
+
+## CPU experiment workflow
+
+Use the experiment runner for reproducible MPI/OMP comparisons. It keeps the
+checked-in input defaults intact and uses environment overrides only for the
+individual experiment:
+
+```bash
+# t=5 screening run: MPI=6, one thread per rank, profile enabled.
+./scripts/run_cpu_experiment.sh --compile --openmp --profile \
+  --mpi 6 --omp 1 --tfinal 5 --label mpi6-omp1-t5
+
+# Submit the same workflow to a 30-core Lab4 CPU allocation.
+./scripts/submit_cpu_experiment.sh --mpi 6 --omp 1 --tfinal 5 \
+  --build-dir /home/$USER/lab4/build-mpi6-omp1-profile --profile --openmp
+```
+
+`--tfinal 40` performs strict validation; short runs use the checker's explicit
+`--allow-partial` mode, which only verifies that the produced trajectory times
+match golden data. Neither mode enables the TwoPuncture cache.
+
+Build switches:
+
+- `AMSS_ENABLE_PROFILE=ON`: rank-aggregated ABE stage timings plus optional
+  Python-driver timing output (`AMSS_PROFILE=1`).
+- `AMSS_ENABLE_OPENMP=ON`: links the OpenMP runtimes and prints the effective
+  thread limit at startup.
+- `AMSS_ENABLE_OMP_KERNELS=ON`: enables the first, explicitly experimental
+  Fortran OpenMP loop set. It requires OpenMP and is disabled by default because
+  the initial MPI=6 ? OMP=5 result was slower than OMP=1.
+
 ## Main Files
 
 - `AMSS_NCKU_Input.py`: the fixed run parameters

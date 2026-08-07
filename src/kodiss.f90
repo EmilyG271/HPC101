@@ -64,6 +64,9 @@ integer, parameter :: NO_SYMM=0, OCTANT=2
 
   call symmetry_bd(3,ex,f,fh,SoA)
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)
   do j=1,ex(2)
   do i=1,ex(1)
@@ -115,6 +118,9 @@ integer, parameter :: NO_SYMM=0, OCTANT=2
   enddo
   enddo
   enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 

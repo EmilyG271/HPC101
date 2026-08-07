@@ -17,6 +17,7 @@ using namespace std;
 #include "cgh.h"
 #include "Parallel.h"
 #include "surface_integral.h"
+#include "amss_profile.h"
 #include "fadmquantites_bssn.h"
 #include "getnp4.h"
 #include "parameters.h"
@@ -202,6 +203,9 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
                                                                  int spinw, int maxl, int NN, double *RP, double *IP,
                                                                  monitor *Monitor) // NN is the length of RP and IP
 {
+#ifdef AMSS_ENABLE_PROFILE
+    amss_profile::Scope wave_surface_scope(amss_profile::WAVE_SURFACE);
+#endif
     if (myrank == 0 && GH->grids[lev] != 1)
         if (Monitor->outfile)
             Monitor->outfile << "WARNING: surface integral on multipatches" << endl;
@@ -230,8 +234,17 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
 #ifdef USE_GPU
     Helper::move_to_gpu_whole(GH->PatL[lev], myrank, DG_List);
 #endif
+#ifdef AMSS_ENABLE_PROFILE
+    { amss_profile::Scope wave_interp_scope(amss_profile::WAVE_INTERP);
+#endif
     GH->PatL[lev]->data->Interp_Points(DG_List, n_tot, pox, shellf, Symmetry);
+#ifdef AMSS_ENABLE_PROFILE
+    }
+#endif
 
+#ifdef AMSS_ENABLE_PROFILE
+    amss_profile::Scope wave_integrate_scope(amss_profile::WAVE_INTEGRATE);
+#endif
     int mp, Lp, Nmin, Nmax;
 
     mp = n_tot / cpusize;
@@ -819,6 +832,9 @@ void surface_integral::surf_MassPAng(double rex, int lev, cgh *GH, var *chi, var
                                      var *Sfx_rhs, var *Sfy_rhs, var *Sfz_rhs, // temparay memory for mass^i
                                      double *Rout, monitor *Monitor)
 {
+#ifdef AMSS_ENABLE_PROFILE
+  amss_profile::Scope adm_surface_scope(amss_profile::ADM_SURFACE);
+#endif
   if (myrank == 0 && GH->grids[lev] != 1)
     if (Monitor && Monitor->outfile)
       Monitor->outfile << "WARNING: surface integral on multipatches" << endl;
@@ -892,8 +908,17 @@ void surface_integral::surf_MassPAng(double rex, int lev, cgh *GH, var *chi, var
 
   // we have assumed there is only one box on this level,
   // so we do not need loop boxes
+#ifdef AMSS_ENABLE_PROFILE
+  { amss_profile::Scope adm_interp_scope(amss_profile::ADM_INTERP);
+#endif
   GH->PatL[lev]->data->Interp_Points(DG_List, n_tot, pox, shellf, Symmetry);
+#ifdef AMSS_ENABLE_PROFILE
+  }
+#endif
 
+#ifdef AMSS_ENABLE_PROFILE
+  amss_profile::Scope adm_integrate_scope(amss_profile::ADM_INTEGRATE);
+#endif
   double Mass_out = 0;
   double ang_outx, ang_outy, ang_outz;
   double p_outx, p_outy, p_outz;

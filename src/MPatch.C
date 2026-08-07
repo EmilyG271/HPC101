@@ -408,12 +408,17 @@ void Patch::Interp_Points(MyList<var> *VarList,
     cudaFree(d_shellf);
     cudaFree(d_weight);
 #else
+#ifdef AMSS_ENABLE_INTERP_OMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int j = 0; j < NN; j++)
     {
         double pox[dim];
         for (int i = 0; i < dim; i++)
             pox[i] = XX[i][j];
 
+        double llb_local[3] = {0.0, 0.0, 0.0};
+        double uub_local[3] = {0.0, 0.0, 0.0};
         MyList<Block> *Bp = blb;
         bool notfind = true;
         while (notfind && Bp)
@@ -423,10 +428,10 @@ void Patch::Interp_Points(MyList<var> *VarList,
             bool flag = true;
             for (int i = 0; i < dim; i++)
             {
-                llb[i] = (feq(BP->bbox[i], bbox[i], DH[i] / 2)) ? BP->bbox[i] + lli[i] * DH[i] : BP->bbox[i] + ghost_width * DH[i];
-                uub[i] = (feq(BP->bbox[dim + i], bbox[dim + i], DH[i] / 2)) ? BP->bbox[dim + i] - uui[i] * DH[i] : BP->bbox[dim + i] - ghost_width * DH[i];
+                llb_local[i] = (feq(BP->bbox[i], bbox[i], DH[i] / 2)) ? BP->bbox[i] + lli[i] * DH[i] : BP->bbox[i] + ghost_width * DH[i];
+                uub_local[i] = (feq(BP->bbox[dim + i], bbox[dim + i], DH[i] / 2)) ? BP->bbox[dim + i] - uui[i] * DH[i] : BP->bbox[dim + i] - ghost_width * DH[i];
 
-                if (XX[i][j] - llb[i] < -DH[i] / 2 || XX[i][j] - uub[i] > DH[i] / 2)
+                if (XX[i][j] - llb_local[i] < -DH[i] / 2 || XX[i][j] - uub_local[i] > DH[i] / 2)
                 {
                     flag = false;
                     break;
@@ -438,13 +443,13 @@ void Patch::Interp_Points(MyList<var> *VarList,
                 notfind = false;
                 if (myrank == BP->rank)
                 {
-                    varl = VarList;
+                    MyList<var> *varl_local = VarList;
                     int k = 0;
-                    while (varl)
+                    while (varl_local)
                     {
-                        f_global_interp(BP->shape, BP->X[0], BP->X[1], BP->X[2], BP->fgfs[varl->data->sgfn], shellf[j * num_var + k],
-                                        pox[0], pox[1], pox[2], ordn, varl->data->SoA, Symmetry);
-                        varl = varl->next;
+                        f_global_interp(BP->shape, BP->X[0], BP->X[1], BP->X[2], BP->fgfs[varl_local->data->sgfn], shellf[j * num_var + k],
+                                        pox[0], pox[1], pox[2], ordn, varl_local->data->SoA, Symmetry);
+                        varl_local = varl_local->next;
                         k++;
                     }
                     weight[j] = 1;
@@ -456,7 +461,6 @@ void Patch::Interp_Points(MyList<var> *VarList,
         }
     }
 #endif
-
     // ================== GPU 零拷贝重构部分 结束 ==================
 
 #ifdef USE_GPU

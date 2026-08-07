@@ -1,5 +1,8 @@
 
 #include "Parallel.h"
+#ifdef AMSS_ENABLE_PROFILE
+#include "amss_profile.h"
+#endif
 #include "fmisc.h"
 #include "prolongrestrict.h"
 #include "misc.h"
@@ -2513,6 +2516,9 @@ void Parallel::transfer(MyList<Parallel::gridseg> **src, MyList<Parallel::gridse
                                                 MyList<var> *VarList1 /* source */, MyList<var> *VarList2 /*target */,
                                                 int Symmetry)
 {
+#ifdef AMSS_ENABLE_PROFILE
+    amss_profile::Scope profile_scope(amss_profile::MPI_TRANSFER);
+#endif
     int myrank, cpusize;
     MPI_Comm_size(MPI_COMM_WORLD, &cpusize);
     MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
@@ -2598,6 +2604,9 @@ void Parallel::transfermix(MyList<Parallel::gridseg> **src, MyList<Parallel::gri
                                                      MyList<var> *VarList1 /* source */, MyList<var> *VarList2 /*target */,
                                                      int Symmetry)
 {
+#ifdef AMSS_ENABLE_PROFILE
+    amss_profile::Scope profile_scope(amss_profile::MPI_TRANSFER);
+#endif
     int myrank, cpusize;
     MPI_Comm_size(MPI_COMM_WORLD, &cpusize);
     MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
@@ -2681,6 +2690,9 @@ void Parallel::transfermix(MyList<Parallel::gridseg> **src, MyList<Parallel::gri
 
 void Parallel::Sync(Patch *Pat, MyList<var> *VarList, int Symmetry)
 {
+#ifdef AMSS_ENABLE_PROFILE
+    amss_profile::Scope profile_scope(amss_profile::MPI_SYNC);
+#endif
     int cpusize;
     MPI_Comm_size(MPI_COMM_WORLD, &cpusize);
 
@@ -2718,6 +2730,9 @@ void Parallel::Sync(Patch *Pat, MyList<var> *VarList, int Symmetry)
 }
 void Parallel::Sync(MyList<Patch> *PatL, MyList<var> *VarList, int Symmetry)
 {
+#ifdef AMSS_ENABLE_PROFILE
+    amss_profile::Scope profile_scope(amss_profile::MPI_SYNC);
+#endif
     // Patch inner Synch
     MyList<Patch> *Pp = PatL;
     while (Pp)

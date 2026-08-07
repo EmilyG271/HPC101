@@ -1,4 +1,4 @@
-build/
+﻿build/
 __pycache__/
 *.pyc
 GW250118*/
@@ -7,3 +7,5 @@ twopuncture_cache/
 *.log
 .vscode/
 .out
+experiments/
+build-*/

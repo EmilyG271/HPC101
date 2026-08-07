@@ -76,6 +76,9 @@ subroutine lopsided(ex,X,Y,Z,f,f_rhs,Sfx,Sfy,Sfz,Symmetry,SoA)
 
 ! upper bound set ex-1 only for efficiency, 
 ! the loop body will set ex 0 also
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -325,6 +328,9 @@ subroutine lopsided(ex,X,Y,Z,f,f_rhs,Sfx,Sfy,Sfz,Symmetry,SoA)
   enddo
   enddo
   enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 

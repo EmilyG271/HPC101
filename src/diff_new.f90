@@ -72,6 +72,9 @@
   fy = ZEO
   fz = ZEO
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -173,6 +176,9 @@
   enddo
   enddo
   enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 
@@ -226,6 +232,9 @@
 
   fx = ZEO
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -250,6 +259,9 @@
   enddo
   enddo
   enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 
@@ -302,6 +314,9 @@
 
   fy = ZEO
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -320,6 +335,9 @@
   enddo
   enddo
   enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 
@@ -372,6 +390,9 @@
 
   fz = ZEO
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -390,6 +411,9 @@
   enddo
   enddo
   enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 
@@ -476,6 +500,9 @@
   fxz = ZEO
   fyz = ZEO
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -597,6 +624,9 @@
    enddo
    enddo
    enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 
@@ -651,6 +681,9 @@
 
   fxx = ZEO
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -666,6 +699,9 @@
    enddo
    enddo
    enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 
@@ -718,6 +754,9 @@
 
   fyy = ZEO
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -735,6 +774,9 @@
    enddo
    enddo
    enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 
@@ -787,6 +829,9 @@
 
   fzz = ZEO
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -804,6 +849,9 @@
    enddo
    enddo
    enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 
@@ -856,6 +904,9 @@
 
   fxy = ZEO
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -874,6 +925,9 @@
    enddo
    enddo
    enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 
@@ -926,6 +980,9 @@
 
   fxz = ZEO
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -942,6 +999,9 @@
    enddo
    enddo
    enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 
@@ -994,6 +1054,9 @@
 
   fyz = ZEO
 
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp parallel do collapse(2) private(i,j,k) schedule(static)
+#endif
   do k=1,ex(3)-1
   do j=1,ex(2)-1
   do i=1,ex(1)-1
@@ -1010,6 +1073,9 @@
    enddo
    enddo
    enddo
+#ifdef AMSS_ENABLE_OMP_KERNELS
+!$omp end parallel do
+#endif
 
   return
 

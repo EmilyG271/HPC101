@@ -56,6 +56,13 @@ OUTPUT_ROOT   = _resolve_under_root(os.environ.get("AMSS_OUTPUT_ROOT"),
 CACHE_ROOT   = _resolve_under_root(os.environ.get("AMSS_CACHE_DIR"),
                                    os.path.join(REPO_ROOT, "twopuncture_cache"))
 SRC_DIR       = os.path.join(REPO_ROOT, "src")
+PROFILE_ENABLED = os.environ.get("AMSS_PROFILE", "0").lower() not in ("", "0", "false", "no", "off")
+
+
+def _profile_stage(name, started):
+    """Emit parseable driver timing only for explicitly profiled experiments."""
+    if PROFILE_ENABLED:
+        print(f" AMSS_DRIVER_PROFILE stage={name} wall_s={time.time() - started:.6f}")
 
 
 def _protected_paths():
@@ -181,6 +188,7 @@ from scripts import makefile_and_run
 
 start_time = time.time()
 
+two_puncture_started = time.time()
 print("\n Initial data method: Ansorg-TwoPuncture\n")
 
 from scripts import generate_TwoPuncture_input
@@ -223,6 +231,9 @@ else:
                          os.path.join(cache_dir, f))
         print(f" TwoPuncture output cached ({key})")
 
+_profile_stage("two_puncture", two_puncture_started)
+input_assembly_started = time.time()
+
 ##################################################################
 ## Update puncture parameters from the TwoPuncture output, then
 ## assemble the final ABE input parfile
@@ -237,17 +248,21 @@ shutil.copy2(os.path.join(File_directory, "AMSS-NCKU.input"),
 ##################################################################
 ## Run the ABE evolution
 
+abe_started = time.time()
 try:
     os.chdir(output_directory)
     makefile_and_run.run_ABE()
 finally:
     os.chdir(REPO_ROOT)
+_profile_stage("abe_evolution", abe_started)
 
 elapsed_time = time.time() - start_time
+_profile_stage("program_cost_boundary", start_time)
 
 ##################################################################
 ## Copy key result files up one level for easy inspection
 
+result_copy_started = time.time()
 shutil.copy(os.path.join(binary_results_directory, "setting.par"),
             os.path.join(output_directory, "AMSSNCKU_setting_parameter"))
 shutil.copy(os.path.join(binary_results_directory, "Error.log"),
@@ -255,6 +270,8 @@ shutil.copy(os.path.join(binary_results_directory, "Error.log"),
 for name in ("bssn_BH.dat", "bssn_ADMQs.dat", "bssn_psi4.dat", "bssn_constraint.dat"):
     shutil.copy(os.path.join(binary_results_directory, name),
                 os.path.join(output_directory, name))
+
+_profile_stage("result_copy", result_copy_started)
 
 ##################################################################
 ## Plot the results (non-fatal: the simulation data is already saved)

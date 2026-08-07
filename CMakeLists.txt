@@ -6,6 +6,10 @@ option(AMSS_ENABLE_GPU "Enable CUDA GPU build (ABEGPU target)" OFF)
 set(AMSS_OPT "-O3" CACHE STRING "C/C++/Fortran optimization level")
 set(AMSS_ARCH_FLAGS "" CACHE STRING "Architecture-specific compiler flags")
 option(AMSS_ENABLE_OPENMP "Link OpenMP to all executables" OFF)
+option(AMSS_ENABLE_PROFILE "Emit MPI stage timing summaries from ABE" OFF)
+option(AMSS_ENABLE_OMP_KERNELS "Enable experimental OpenMP regions in CPU Fortran kernels" OFF)
+option(AMSS_ENABLE_TWOP_OMP "Enable experimental OpenMP regions in TwoPuncture" OFF)
+option(AMSS_ENABLE_INTERP_OMP "Enable experimental OpenMP worksharing in CPU interpolation" OFF)
 set(AMSS_MPI_CUDA_AWARE 0 CACHE STRING "Set MPI_CUDA_AWARE macro for ABEGPU (0/1)")
 set_property(CACHE AMSS_MPI_CUDA_AWARE PROPERTY STRINGS 0 1)
 
@@ -24,6 +28,11 @@ add_compile_options(
   "$<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,IntelLLVM,Intel,ARMClang>:${AMSS_OPT_LIST};${AMSS_ARCH_FLAGS_LIST};-fno-strict-aliasing;-Wno-deprecated;-Dfortran3;-Dnewc>"
   "$<$<COMPILE_LANG_AND_ID:Fortran,GNU,Flang,IntelLLVM,Intel,ARMClang>:${AMSS_OPT_LIST};${AMSS_ARCH_FLAGS_LIST};-fno-strict-aliasing;-cpp>"
 )
+
+# Forward opt flags to the linker (e.g. -flto) so whole-program LTO
+# actually takes effect; without this GCC fat-LTO objects link with their
+# non-LTO machine code and -flto is a silent no-op at link time.
+add_link_options(${AMSS_OPT_LIST})
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -46,22 +55,48 @@ set(AMSS_F90SOURCES
 set(ABE_SOURCES
   src/ABE.C src/Ansorg.C src/Block.C src/MPatch.C src/Parallel.C
   src/bssn_class.C src/cgh.C src/checkpoint.C
-  src/misc.C src/monitor.C src/perf.C
+  src/misc.C src/monitor.C src/perf.C src/amss_profile.C
   src/surface_integral.C src/transpbh.C src/var.C
   ${AMSS_F90SOURCES}
 )
 add_executable(ABE ${ABE_SOURCES})
 target_link_libraries(ABE PRIVATE MPI::MPI_CXX)
+if(AMSS_ENABLE_PROFILE)
+  target_compile_definitions(ABE PRIVATE AMSS_ENABLE_PROFILE=1)
+endif()
 
 # --- TwoPunctureABE: initial-data solver -----------------------------------
 add_executable(TwoPunctureABE src/TwoPunctureABE.C src/TwoPunctures.C)
 target_link_libraries(TwoPunctureABE PRIVATE MPI::MPI_CXX)
+if(AMSS_ENABLE_PROFILE)
+  target_compile_definitions(TwoPunctureABE PRIVATE AMSS_ENABLE_TWOP_PROFILE=1)
+endif()
 
 # --- Optional OpenMP --------------------------------------------------------
+if(AMSS_ENABLE_OMP_KERNELS AND NOT AMSS_ENABLE_OPENMP)
+  message(FATAL_ERROR "AMSS_ENABLE_OMP_KERNELS requires AMSS_ENABLE_OPENMP=ON")
+endif()
+if(AMSS_ENABLE_INTERP_OMP AND NOT AMSS_ENABLE_OPENMP)
+  message(FATAL_ERROR "AMSS_ENABLE_INTERP_OMP requires AMSS_ENABLE_OPENMP=ON")
+endif()
+if(AMSS_ENABLE_TWOP_OMP AND NOT AMSS_ENABLE_OPENMP)
+  message(FATAL_ERROR "AMSS_ENABLE_TWOP_OMP requires AMSS_ENABLE_OPENMP=ON")
+endif()
 if(AMSS_ENABLE_OPENMP)
   find_package(OpenMP REQUIRED COMPONENTS CXX Fortran)
   target_link_libraries(ABE PRIVATE OpenMP::OpenMP_CXX OpenMP::OpenMP_Fortran)
   target_link_libraries(TwoPunctureABE PRIVATE OpenMP::OpenMP_CXX)
+  target_compile_definitions(ABE PRIVATE AMSS_ENABLE_OPENMP=1)
+  target_compile_definitions(TwoPunctureABE PRIVATE AMSS_ENABLE_OPENMP=1)
+  if(AMSS_ENABLE_OMP_KERNELS)
+    target_compile_definitions(ABE PRIVATE AMSS_ENABLE_OMP_KERNELS=1)
+  endif()
+  if(AMSS_ENABLE_TWOP_OMP)
+    target_compile_definitions(TwoPunctureABE PRIVATE AMSS_ENABLE_TWOP_OMP=1)
+  endif()
+  if(AMSS_ENABLE_INTERP_OMP)
+    target_compile_definitions(ABE PRIVATE AMSS_ENABLE_INTERP_OMP=1)
+  endif()
 endif()
 
 # --- ABEGPU: GPU evolution executable (device-resident baseline) -----------
@@ -113,5 +148,5 @@ if(AMSS_ENABLE_GPU)
 else()
   message(STATUS "GPU      : OFF")
 endif()
-message(STATUS "AMSS_OPT=${AMSS_OPT} ARCH_FLAGS=${AMSS_ARCH_FLAGS} OPENMP=${AMSS_ENABLE_OPENMP} MPI_CUDA_AWARE=${AMSS_MPI_CUDA_AWARE}")
+message(STATUS "AMSS_OPT=${AMSS_OPT} ARCH_FLAGS=${AMSS_ARCH_FLAGS} OPENMP=${AMSS_ENABLE_OPENMP} OMP_KERNELS=${AMSS_ENABLE_OMP_KERNELS} TWOP_OMP=${AMSS_ENABLE_TWOP_OMP} INTERP_OMP=${AMSS_ENABLE_INTERP_OMP} PROFILE=${AMSS_ENABLE_PROFILE} MPI_CUDA_AWARE=${AMSS_MPI_CUDA_AWARE}")
 message(STATUS "==========================================================")

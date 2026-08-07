@@ -264,6 +264,12 @@ def build_parser():
         default=TIME_TOLERANCE,
         help=f"absolute trajectory time tolerance (default: {TIME_TOLERANCE:g})",
     )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help=("validate only the trajectory times produced by RESULT_DIR; "
+              "intended for short debug runs such as t=5, not formal t=40 validation"),
+    )
     return parser
 
 
@@ -304,13 +310,21 @@ def main():
         print("FINAL: FAIL")
         return 1
 
-    reference_path = golden_directory / "bssn_BH.dat"
-    target_path = result_directory / "bssn_BH.dat"
+    if args.allow_partial:
+        # The result is the reference so every emitted result time must exist
+        # in golden; this permits short runs without weakening formal mode.
+        reference_path = result_directory / "bssn_BH.dat"
+        target_path = golden_directory / "bssn_BH.dat"
+    else:
+        reference_path = golden_directory / "bssn_BH.dat"
+        target_path = result_directory / "bssn_BH.dat"
     constraint_path = result_directory / "bssn_constraint.dat"
     failed = False
 
     print(f"Golden: {golden_directory}")
     print(f"Result: {result_directory}")
+    if args.allow_partial:
+        print("Trajectory mode: partial result coverage against golden")
 
     try:
         reference = read_trajectory(reference_path)

@@ -15,6 +15,9 @@ using namespace std;
 #include "fmisc.h"
 #include "Parallel.h"
 #include "bssn_class.h"
+#ifdef AMSS_ENABLE_PROFILE
+#include "amss_profile.h"
+#endif
 #include "bssn_rhs.h"
 #include "initial_puncture.h"
 #include "enforce_algebra.h"
@@ -550,6 +553,9 @@ bssn_class::bssn_class(double Couranti, double StartTimei, double TotalTimei,
 
 void bssn_class::Initialize()
 {
+#ifdef AMSS_ENABLE_PROFILE
+  amss_profile::Scope profile_scope(amss_profile::INITIALIZE);
+#endif
   if (myrank == 0)
     cout << " you have setted " << ngfs << " grid functions." << endl;
 
@@ -1532,6 +1538,9 @@ void bssn_class::Read_Ansorg()
 
 void bssn_class::Evolve(int Steps)
 {
+#ifdef AMSS_ENABLE_PROFILE
+  amss_profile::Scope profile_scope(amss_profile::EVOLVE);
+#endif
   clock_t prev_clock, curr_clock;
   double LastDump = 0.0, LastCheck = 0.0, Last2dDump = 0.0;
   LastAnas = 0;
@@ -1687,6 +1696,10 @@ void bssn_class::Evolve(int Steps)
       CheckPoint->write_bssn(LastDump, Last2dDump, LastAnas);
     }
   }
+#ifdef AMSS_ENABLE_PROFILE
+  profile_scope.stop();
+  amss_profile::report();
+#endif
 }
 
 //================================================================================================
@@ -1703,6 +1716,9 @@ void bssn_class::Evolve(int Steps)
 
 void bssn_class::RecursiveStep(int lev)
 {
+#ifdef AMSS_ENABLE_PROFILE
+  amss_profile::Scope profile_scope(amss_profile::RECURSIVE_STEP);
+#endif
   double dT_lev = dT * pow(0.5, Mymax(lev, trfls));
 
   int NoIterations = 1, YN;
@@ -1770,6 +1786,9 @@ void bssn_class::RecursiveStep(int lev)
 //================================================================================================
 void bssn_class::Step(int lev, int YN)
 {
+#ifdef AMSS_ENABLE_PROFILE
+  amss_profile::Scope profile_scope(amss_profile::LEVEL_STEP);
+#endif
   setpbh(BH_num, Porg0, Mass, BH_num_input);
 
   double dT_lev = dT * pow(0.5, Mymax(lev, trfls));
@@ -2169,6 +2188,9 @@ void bssn_class::RestrictProlong(int lev, int YN, bool BB,
 //
 // SynchList_cor  old -----------
 {
+#ifdef AMSS_ENABLE_PROFILE
+  amss_profile::Scope profile_scope(amss_profile::RESTRICT_PROLONG);
+#endif
 
   if (lev > 0)
   {
@@ -2459,6 +2481,9 @@ void bssn_class::ProlongRestrict(int lev, int YN, bool BB)
 
 void bssn_class::Compute_Psi4(int lev)
 {
+#ifdef AMSS_ENABLE_PROFILE
+  amss_profile::Scope profile_scope(amss_profile::PSI4);
+#endif
   MyList<var> *DG_List = new MyList<var>(Rpsi4);
   DG_List->insert(Ipsi4);
 
@@ -2935,6 +2960,9 @@ void bssn_class::compute_Porg_rhs(double **BH_PS, double **BH_RHS, var *forx, va
 
 void bssn_class::AnalysisStuff(int lev, double dT_lev)
 {
+#ifdef AMSS_ENABLE_PROFILE
+  amss_profile::Scope profile_scope(amss_profile::ANALYSIS);
+#endif
   LastAnas += dT_lev;
 
   if (LastAnas >= AnasTime)
@@ -2998,6 +3026,9 @@ void bssn_class::AnalysisStuff(int lev, double dT_lev)
 
 void bssn_class::Constraint_Out()
 {
+#ifdef AMSS_ENABLE_PROFILE
+  amss_profile::Scope profile_scope(amss_profile::CONSTRAINT);
+#endif
   LastConsOut += dT * pow(0.5, Mymax(0, trfls));
 
   if (LastConsOut >= AnasTime)
