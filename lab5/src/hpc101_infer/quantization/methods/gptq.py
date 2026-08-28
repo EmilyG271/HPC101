@@ -211,11 +211,28 @@ def quantize_weight_gptq(
             (out_features, num_groups), dtype=torch.uint8, device=device
         )
 
-    # Quantize columns in GPTQ order. At the beginning of each group, qparams
-    # are frozen from the currently error-compensated weights; subsequent
-    # columns in that group use the same scale/zero point. Quantization error is
-    # propagated through H^{-1}; block_size bounds the temporary correction
-    # matrix kept in memory.
+    # GPTQ uses fixed group parameters found from the original (unmodified)
+    # weight. The error-compensated work matrix must not change the scale after
+    # the first column of a group has been processed; doing so is a common
+    # source of avoidable calibration drift.
+    for group in range(num_groups):
+        group_start = group * group_size
+        group_end = group_start + group_size
+        group_weights = work[:, group_start:group_end]
+        if symmetric:
+            scales[:, group] = group_weights.abs().amax(dim=1).div(7.0).clamp_min(eps)
+        else:
+            minimum = group_weights.amin(dim=1)
+            maximum = group_weights.amax(dim=1)
+            minimum = torch.minimum(minimum, torch.zeros_like(minimum))
+            maximum = torch.maximum(maximum, torch.zeros_like(maximum))
+            scale = (maximum - minimum).div(15.0).clamp_min(eps)
+            scales[:, group] = scale
+            assert zeros is not None
+            zeros[:, group] = torch.round(-minimum / scale).clamp(0, 15).to(torch.uint8)
+
+    # Quantize columns in GPTQ order. Quantization error is propagated through
+    # H^{-1}; block_size bounds the temporary correction matrix kept in memory.
     predicted_loss = torch.zeros((), device=device, dtype=torch.float64)
     for block_start in range(0, padded_in_features, block_size):
         block_end = min(block_start + block_size, padded_in_features)
@@ -226,24 +243,6 @@ def quantize_weight_gptq(
         )
         for column in range(block_start, block_end):
             group = column // group_size
-            group_start = group * group_size
-            group_end = group_start + group_size
-            if column == group_start:
-                group_weights = work[:, group_start:group_end]
-                if symmetric:
-                    scale = group_weights.abs().amax(dim=1).div(7.0).clamp_min(eps)
-                    scales[:, group] = scale
-                else:
-                    minimum = group_weights.amin(dim=1)
-                    maximum = group_weights.amax(dim=1)
-                    minimum = torch.minimum(minimum, torch.zeros_like(minimum))
-                    maximum = torch.maximum(maximum, torch.zeros_like(maximum))
-                    scale = (maximum - minimum).div(15.0).clamp_min(eps)
-                    zero = torch.round(-minimum / scale).clamp(0, 15)
-                    scales[:, group] = scale
-                    assert zeros is not None
-                    zeros[:, group] = zero.to(torch.uint8)
-
             scale = scales[:, group]
             if symmetric:
                 quantized_value = torch.round(work[:, column] / scale).clamp(-8, 7)
