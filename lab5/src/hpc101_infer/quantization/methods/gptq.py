@@ -172,19 +172,29 @@ def quantize_weight_gptq(
     hessian.diagonal().add_(damping)
 
     # Retry with increasing diagonal jitter for pathological calibration data.
+    # Do not materialize an additional dense identity matrix: for the 14,336
+    # input features of Gemma's MLP, that temporary allocation is large enough
+    # to exhaust a 10-GiB MIG slice.
     hessian_inverse: torch.Tensor | None = None
-    jitter = torch.finfo(torch.float32).eps * mean_diagonal
-    eye = torch.eye(hessian.shape[0], device=device, dtype=hessian.dtype)
-    for attempt in range(5):
-        candidate = hessian if attempt == 0 else hessian + jitter * (10.0 ** attempt) * eye
-        chol, info = torch.linalg.cholesky_ex(candidate, check_errors=False)
+    inverse_diagonal: torch.Tensor | None = None
+    for attempt in range(6):
+        if attempt:
+            # Start above FP32 roundoff and grow to a conservative diagonal
+            # regularizer for rank-deficient short calibration sets.
+            extra_jitter = mean_diagonal * (10.0 ** (-3 + attempt))
+            hessian.diagonal().add_(extra_jitter)
+        chol, info = torch.linalg.cholesky_ex(hessian, check_errors=False)
         if int(info.item()) == 0:
             hessian_inverse = torch.cholesky_inverse(chol)
+            del chol
             break
     if hessian_inverse is None:
-        # This is slower, but keeps the quantizer usable for unusual inputs.
-        hessian_inverse = torch.linalg.pinv(hessian, hermitian=True)
-    del hessian, eye
+        # A dense pseudo-inverse has an enormous SVD workspace and can OOM even
+        # when the normal GPTQ state fits. Use a diagonal Hessian approximation
+        # as a safe last resort; this keeps the quantizer bounded and still
+        # applies activation-aware per-column weighting.
+        inverse_diagonal = hessian.diagonal().clamp_min(eps).reciprocal()
+    del hessian
 
     encoded = torch.empty(
         (out_features, padded_in_features), dtype=torch.uint8, device=device
@@ -250,17 +260,21 @@ def quantize_weight_gptq(
                 encoded[:, column] = quantized_code.to(torch.uint8)
                 reconstructed = (quantized_code - zero) * scale
 
-            diagonal_value = hessian_inverse[column, column].clamp_min(eps)
+            if hessian_inverse is not None:
+                diagonal_value = hessian_inverse[column, column].clamp_min(eps)
+            else:
+                assert inverse_diagonal is not None
+                diagonal_value = inverse_diagonal[column]
             error = (work[:, column] - reconstructed) / diagonal_value
             block_error[:, column - block_start] = error
             predicted_loss += error.double().square().sum() * diagonal_value.double()
 
-            if column + 1 < block_end:
+            if hessian_inverse is not None and column + 1 < block_end:
                 work[:, column + 1 : block_end].sub_(
                     error[:, None] * hessian_inverse[column, column + 1 : block_end][None, :]
                 )
 
-        if block_end < padded_in_features:
+        if hessian_inverse is not None and block_end < padded_in_features:
             work[:, block_end:].sub_(
                 block_error.matmul(hessian_inverse[block_start:block_end, block_end:])
             )
