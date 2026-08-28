@@ -1,8 +1,8 @@
 engine:
   dtype: bfloat16
   device: cuda
-  max_batch_size: 4
-  scheduler_batch_size: 4
+  max_batch_size: 1
+  scheduler_batch_size: 1
   max_sequence_length: 2048
   linear_backend: bf16
   scheduler_backend: static_batch

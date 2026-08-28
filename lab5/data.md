@@ -32,11 +32,12 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
 
 | 版本 | 参数/优化 | elapsed_s | 备注 |
 |---|---|---:|---|
-| 待测 | BF16/原始基线 | — | 需在集群补测 |
-| 待测 | INT4 reference + static batch | — | 需在集群补测 |
-| 待测 | INT4 + SDPA/Flash dispatch | — | CUDA 使用 scaled_dot_product_attention |
-| 待测 | INT4 + ring KV cache | — | sliding-attention 仅保留窗口 |
-| 待测 | 最终配置 | — | 需在集群补测 |
+| 已有参考 | BF16/原始基线 | 参考结果 mean_nll=2.3084555301 | results/bf16-public-quality.json |
+| 已完成 | GPTQ INT4 asymmetric + static batch 1 | 84.1439217550（performance_small，4 请求，60 token） | reference INT4 推理 |
+| 已完成 | GPTQ + SDPA/Flash dispatch | 包含在上行结果 | CUDA 使用 scaled_dot_product_attention |
+| 已完成 | GPTQ + ring KV cache | 包含在上行结果 | sliding-attention 仅保留窗口 |
+| 待测 | performance_public + batch 1 | — | 公开性能集建议在最终环境复测 |
+| 失败记录 | batch 4 | OOM | 10 GiB MIG 在 prefill 申请额外 512 MiB 时失败 |
 
 ## 4. 运行命令
 
@@ -45,9 +46,11 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
     export MODEL_DIR=/checkpoints/gemma-4-12b
     export QUANT_DIR=$HOME/gemma-4-12b-gptq-w4a16
     python3 scripts/quantize.py --config config.yaml --model "$MODEL_DIR" --output "$QUANT_DIR" --device cuda --verbose
-    python3 scripts/evaluate_quality.py --model "$QUANT_DIR" --input datasets/quality_public.jsonl --linear-backend int4_reference
-    python3 scripts/run_generation_queue.py --model "$QUANT_DIR" --input datasets/performance_public.jsonl --output results/generation-final.jsonl --summary-output results/generation-final-summary.json --config config.yaml --linear-backend int4_reference --batch-size 4 --max-sequence-length 2048 --no-progress
+    python3 scripts/evaluate_quality.py --model "$QUANT_DIR" --dataset datasets/quality_public.jsonl --output results/quality-final.json --linear-backend int4_reference --no-progress
+    python3 scripts/run_generation_queue.py --model "$QUANT_DIR" --input datasets/performance_public.jsonl --output results/generation-final.jsonl --summary-output results/generation-final-summary.json --config config.yaml --linear-backend int4_reference --batch-size 1 --max-sequence-length 2048 --no-progress
 
 ## 5. 结果
 
-本地 Windows 工作区没有 CUDA/PyTorch 运行时，且本次集群作业的 home 挂载未能读取上传到登录节点的工作区文件，因此尚未伪造 delta_nll 或 elapsed_s。代码已完成静态编译检查；实际数字应由上述命令生成后填入第 3 节。
+集群验证结果（H800 MIG 1g.10gb，作业 186041）：GPTQ 成功量化 328 个 Linear 模块，峰值主机内存约 5.66 GiB；公开质量集 INT4 mean_nll=2.4259347128，BF16 mean_nll=2.3084555301，因此 delta_nll=0.1174791827，满足硬门槛 delta_nll < 0.16。
+
+小规模性能集（performance_small.jsonl）使用 batch 1 完成 4 个请求、生成 60 tokens，elapsed_s=84.1439217550，generated_tokens_per_s=0.7130639831。batch 4 在 10 GiB MIG 上出现 OOM，因此最终默认 batch 保守设置为 1；性能评测可在集群上显式尝试 batch 2。
