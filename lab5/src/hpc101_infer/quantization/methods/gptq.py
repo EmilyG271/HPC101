@@ -116,15 +116,159 @@ def quantize_weight_gptq(
     if not torch.isfinite(weight).all():
         raise ValueError("weight must contain only finite values")
 
-    raise NotImplementedError("TODO: Implement the GPTQ quantization algorithm here.")
+    # GPTQ minimizes the calibration-weighted output error rather than the
+    # unweighted weight error. Work in FP32 for the Hessian and error
+    # propagation; only the small quantization metadata is cast at the end.
+    # The pipeline calls this routine one Linear at a time, so at most one
+    # large Hessian is resident on the GPU.
+    device = weight.device
+    out_features, in_features = weight.shape
+    padded_in_features = math.ceil(in_features / group_size) * group_size
+    num_groups = padded_in_features // group_size
 
-    quantized = QuantizedWeight(...)
+    work = weight.detach().to(device=device, dtype=torch.float32).clone()
+    if padded_in_features != in_features:
+        work = F.pad(work, (0, padded_in_features - in_features))
+
+    # H = X^T X / N. A damped Cholesky inverse is more stable than explicitly
+    # forming a pseudo-inverse for the nearly rank-deficient matrices produced
+    # by short calibration sets.
+    calibration = activations.detach().to(device=device, dtype=torch.float32)
+    tokens = calibration.shape[0]
+    hessian = calibration.transpose(0, 1).matmul(calibration) / float(max(tokens, 1))
+    del calibration
+
+    diagonal = torch.diagonal(hessian).clone()
+    if not bool(torch.isfinite(diagonal).all()):
+        raise ValueError("activation Hessian contains non-finite diagonal entries")
+    dead = diagonal <= torch.finfo(torch.float32).eps
+    dead_columns = int(dead.sum().item())
+    if dead_columns:
+        # Make dead features independent so the factorization stays valid even
+        # when the number of calibration tokens is smaller than in_features.
+        hessian[dead, :] = 0.0
+        hessian[:, dead] = 0.0
+        hessian.diagonal()[dead] = 1.0
+        diagonal = torch.diagonal(hessian).clone()
+
+    mean_diagonal = diagonal[~dead].mean() if bool((~dead).any()) else diagonal.mean()
+    if not bool(torch.isfinite(mean_diagonal)) or float(mean_diagonal) <= 0.0:
+        mean_diagonal = torch.tensor(1.0, device=device, dtype=torch.float32)
+    damping = float(damp_percent) * mean_diagonal
+    hessian.diagonal().add_(damping)
+
+    # Retry with increasing diagonal jitter for pathological calibration data.
+    hessian_inverse: torch.Tensor | None = None
+    jitter = torch.finfo(torch.float32).eps * mean_diagonal
+    eye = torch.eye(hessian.shape[0], device=device, dtype=hessian.dtype)
+    for attempt in range(5):
+        candidate = hessian if attempt == 0 else hessian + jitter * (10.0 ** attempt) * eye
+        chol, info = torch.linalg.cholesky_ex(candidate, check_errors=False)
+        if int(info.item()) == 0:
+            hessian_inverse = torch.cholesky_inverse(chol)
+            break
+    if hessian_inverse is None:
+        # This is slower, but keeps the quantizer usable for unusual inputs.
+        hessian_inverse = torch.linalg.pinv(hessian, hermitian=True)
+    del hessian, eye
+
+    encoded = torch.empty(
+        (out_features, padded_in_features), dtype=torch.uint8, device=device
+    )
+    scales = torch.empty(
+        (out_features, num_groups), dtype=torch.float32, device=device
+    )
+    zeros: torch.Tensor | None
+    if symmetric:
+        zeros = None
+    else:
+        zeros = torch.empty(
+            (out_features, num_groups), dtype=torch.uint8, device=device
+        )
+
+    # Quantize columns in GPTQ order. At the beginning of each group, qparams
+    # are frozen from the currently error-compensated weights; subsequent
+    # columns in that group use the same scale/zero point. Quantization error is
+    # propagated through H^{-1}; block_size bounds the temporary correction
+    # matrix kept in memory.
+    predicted_loss = torch.zeros((), device=device, dtype=torch.float64)
+    eps = torch.finfo(torch.float32).eps
+    for block_start in range(0, padded_in_features, block_size):
+        block_end = min(block_start + block_size, padded_in_features)
+        block_error = torch.empty(
+            (out_features, block_end - block_start),
+            device=device,
+            dtype=torch.float32,
+        )
+        for column in range(block_start, block_end):
+            group = column // group_size
+            group_start = group * group_size
+            group_end = group_start + group_size
+            if column == group_start:
+                group_weights = work[:, group_start:group_end]
+                if symmetric:
+                    scale = group_weights.abs().amax(dim=1).div(7.0).clamp_min(eps)
+                    scales[:, group] = scale
+                else:
+                    minimum = group_weights.amin(dim=1)
+                    maximum = group_weights.amax(dim=1)
+                    minimum = torch.minimum(minimum, torch.zeros_like(minimum))
+                    maximum = torch.maximum(maximum, torch.zeros_like(maximum))
+                    scale = (maximum - minimum).div(15.0).clamp_min(eps)
+                    zero = torch.round(-minimum / scale).clamp(0, 15)
+                    scales[:, group] = scale
+                    assert zeros is not None
+                    zeros[:, group] = zero.to(torch.uint8)
+
+            scale = scales[:, group]
+            if symmetric:
+                quantized_value = torch.round(work[:, column] / scale).clamp(-8, 7)
+                encoded[:, column] = (quantized_value.to(torch.int16) + 8).to(
+                    torch.uint8
+                )
+                reconstructed = quantized_value * scale
+            else:
+                assert zeros is not None
+                zero = zeros[:, group].to(torch.float32)
+                quantized_code = torch.round(work[:, column] / scale + zero).clamp(
+                    0, 15
+                )
+                encoded[:, column] = quantized_code.to(torch.uint8)
+                reconstructed = (quantized_code - zero) * scale
+
+            diagonal_value = hessian_inverse[column, column].clamp_min(eps)
+            error = (work[:, column] - reconstructed) / diagonal_value
+            block_error[:, column - block_start] = error
+            predicted_loss += error.double().square().sum() * diagonal_value.double()
+
+            if column + 1 < block_end:
+                work[:, column + 1 : block_end].sub_(
+                    error[:, None] * hessian_inverse[column, column + 1 : block_end][None, :]
+                )
+
+        if block_end < padded_in_features:
+            work[:, block_end:].sub_(
+                block_error.matmul(hessian_inverse[block_start:block_end, block_end:])
+            )
+        del block_error
+
+    quantized = QuantizedWeight(
+        qweight=pack_int4(encoded),
+        scales=scales.to(scale_dtype),
+        zeros=zeros,
+        original_shape=(out_features, in_features),
+        padded_shape=(out_features, padded_in_features),
+        bits=4,
+        group_size=group_size,
+        symmetric=symmetric,
+        packing="uint8_little_nibble",
+    )
     metadata: dict[str, float | int] = {
-        "activation_tokens": activations.shape[0],
+        "activation_tokens": tokens,
         "block_size": block_size,
         "damp_percent": damp_percent,
-        "dead_columns": ...,
-        "predicted_loss": ...,
+        "dead_columns": dead_columns,
+        "predicted_loss": float(predicted_loss.item()),
     }
     return quantized, metadata
 

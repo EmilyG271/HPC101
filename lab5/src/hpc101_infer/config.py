@@ -74,8 +74,10 @@ def _optional_boolean(value: object, location: str) -> bool | None:
 class EngineConfig:
     dtype: torch.dtype = torch.bfloat16
     device: str = "cuda"
-    max_batch_size: int = 1
-    scheduler_batch_size: int = 1
+    # A small static batch keeps the 10-GiB MIG instance busy while leaving
+    # headroom for the quantized weights and temporary activations.
+    max_batch_size: int = 4
+    scheduler_batch_size: int = 4
     max_sequence_length: int = 4096
     attention_backend: str = "eager"
     linear_backend: str = "bf16"

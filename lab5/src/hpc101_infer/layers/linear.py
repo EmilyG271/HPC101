@@ -186,9 +186,10 @@ class QuantizedLinearFactory:
                 f"manifest shape mismatch for {module_name}: "
                 f"manifest={entry.original_shape}, model={(out_features, in_features)}"
             )
-        scale_dtype = (
-            dtype if dtype in {torch.float16, torch.bfloat16} else self.scale_dtype
-        )
+        # ``dtype`` is the activation/compute dtype, not the checkpoint
+        # metadata dtype. Preserve the latter so FP16 scales do not silently
+        # expand to BF16 on every loaded module.
+        del dtype
         return QuantizedLinear(
             in_features,
             out_features,
@@ -197,5 +198,5 @@ class QuantizedLinearFactory:
             padded_in_features=entry.padded_shape[1],
             bias=bias,
             device=device,
-            scale_dtype=scale_dtype,
+            scale_dtype=self.scale_dtype,
         )

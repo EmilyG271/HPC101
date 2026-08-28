@@ -21,7 +21,12 @@ class LayerKVCache:
     lengths: torch.Tensor
     max_batch_size: int
     max_sequence_length: int
+    # Sliding-window layers use a ring buffer whose physical capacity is
+    # ``max_sequence_length``. Full-attention layers keep the original prefix
+    # cache and leave this flag false.
+    ring: bool = False
     batch_size: int = 0
+    pending_lengths: torch.Tensor | None = None
 
     def reset(self, batch_size: int) -> None:
         """开始新的静态 batch；旧 tensor 不清零，只重置有效长度。"""
@@ -32,6 +37,10 @@ class LayerKVCache:
             )
         self.batch_size = batch_size
         self.lengths.zero_()
+        if self.pending_lengths is None:
+            self.pending_lengths = torch.zeros_like(self.lengths)
+        else:
+            self.pending_lengths.zero_()
 
     def write(
         self,
@@ -48,27 +57,71 @@ class LayerKVCache:
                 f"invalid key shape {tuple(key.shape)}, expected "
                 f"{expected_prefix + expected_suffix}"
             )
-        for batch_idx in range(batch_size):
-            target = positions[batch_idx]
-            self.key[batch_idx].index_copy_(1, target, key[batch_idx])
-            self.value[batch_idx].index_copy_(1, target, value[batch_idx])
+        if self.ring:
+            capacity = self.max_sequence_length
+            for batch_idx in range(batch_size):
+                target = positions[batch_idx].remainder(capacity)
+                self.key[batch_idx].index_copy_(1, target, key[batch_idx])
+                self.value[batch_idx].index_copy_(1, target, value[batch_idx])
+        else:
+            for batch_idx in range(batch_size):
+                target = positions[batch_idx]
+                self.key[batch_idx].index_copy_(1, target, key[batch_idx])
+                self.value[batch_idx].index_copy_(1, target, value[batch_idx])
+
+        # ``lengths`` is committed only after all decoder layers finish. Keep a
+        # pending upper bound so a ring view is correct during the current
+        # forward (including prefill, when committed lengths are still zero).
+        assert self.pending_lengths is not None
+        self.pending_lengths[:batch_size] = torch.maximum(
+            self.pending_lengths[:batch_size],
+            positions.amax(dim=1) + 1,
+        )
 
     def view(self, max_length: int) -> "LayerKVView":
-        """只暴露当前 batch 在 ``max_length`` 以内的连续 cache 前缀。"""
+        """Return a logical chronological view of the current cache.
+
+        Ring layers gather only the last window and expose their absolute token
+        positions so attention can mask against positions rather than physical
+        ring indices.
+        """
+        if max_length <= 0:
+            raise ValueError("max_length must be positive")
+        if not self.ring:
+            return LayerKVView(
+                key=self.key[: self.batch_size, :, :max_length, :],
+                value=self.value[: self.batch_size, :, :max_length, :],
+            )
+
+        assert self.pending_lengths is not None
+        length = min(max_length, self.max_sequence_length)
+        logical_lengths = self.pending_lengths[: self.batch_size]
+        starts = (logical_lengths - length).clamp_min(0)
+        positions = starts[:, None] + torch.arange(
+            length, device=self.key.device, dtype=torch.long
+        )[None, :]
+        indices = positions.remainder(self.max_sequence_length)
+        gather_index = indices[:, None, :, None].expand(
+            self.batch_size, self.key.shape[1], length, self.key.shape[3]
+        )
         return LayerKVView(
-            key=self.key[: self.batch_size, :, :max_length, :],
-            value=self.value[: self.batch_size, :, :max_length, :],
+            key=torch.gather(self.key[: self.batch_size], 2, gather_index),
+            value=torch.gather(self.value[: self.batch_size], 2, gather_index),
+            key_positions=positions,
         )
 
     def commit(self, sequence_lengths: torch.Tensor) -> None:
         """在一次模型 forward 完成后提交新的有效序列长度。"""
         self.lengths[: self.batch_size].copy_(sequence_lengths)
+        assert self.pending_lengths is not None
+        self.pending_lengths[: self.batch_size].copy_(sequence_lengths)
 
 
 @dataclass(frozen=True)
 class LayerKVView:
     key: torch.Tensor
     value: torch.Tensor
+    key_positions: torch.Tensor | None = None
 
 
 class KVCache:
@@ -107,7 +160,13 @@ class KVCache:
                 head_dim = config.head_dim
             else:
                 raise ValueError(f"unsupported attention type: {layer_type!r}")
-            shape = (max_batch_size, kv_heads, max_sequence_length, head_dim)
+            ring = layer_type == "sliding_attention"
+            capacity = (
+                min(max_sequence_length, config.sliding_window)
+                if ring
+                else max_sequence_length
+            )
+            shape = (max_batch_size, kv_heads, capacity, head_dim)
             layers.append(
                 LayerKVCache(
                     key=torch.empty(shape, dtype=dtype, device=device),
@@ -116,7 +175,11 @@ class KVCache:
                         max_batch_size, dtype=torch.long, device=device
                     ),
                     max_batch_size=max_batch_size,
-                    max_sequence_length=max_sequence_length,
+                    max_sequence_length=capacity,
+                    ring=ring,
+                    pending_lengths=torch.zeros(
+                        max_batch_size, dtype=torch.long, device=device
+                    ),
                 )
             )
         return cls(layers, max_batch_size, max_sequence_length)

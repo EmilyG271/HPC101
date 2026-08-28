@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from hpc101_infer.layers.linear import BF16LinearFactory, LinearFactory
 from hpc101_infer.layers.norm import RMSNorm
@@ -37,14 +40,20 @@ def make_attention_mask(
     layer_type: str,
     dtype: torch.dtype,
     sliding_window: int = -1,
+    key_positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """同时屏蔽未来 token、padding token 和滑动窗口外的历史 token。"""
-    key_positions = torch.arange(key_length, device=positions.device)
+    if key_positions is None:
+        key_positions = torch.arange(key_length, device=positions.device).expand(
+            positions.shape[0], -1
+        )
+    elif key_positions.shape != (positions.shape[0], key_length):
+        raise ValueError("key_positions must have shape [batch, key_length]")
     query_valid = positions < sequence_lengths[:, None]
-    allowed = key_positions[None, None, :] <= positions[:, :, None]
-    allowed &= key_positions[None, None, :] < sequence_lengths[:, None, None]
+    allowed = key_positions[:, None, :] <= positions[:, :, None]
+    allowed &= key_positions[:, None, :] < sequence_lengths[:, None, None]
     if layer_type == "sliding_attention":
-        allowed &= key_positions[None, None, :] > (
+        allowed &= key_positions[:, None, :] > (
             positions[:, :, None] - sliding_window
         )
     allowed &= query_valid[:, :, None]
@@ -55,6 +64,39 @@ def make_attention_mask(
     mask = torch.zeros(allowed.shape, device=positions.device, dtype=dtype)
     mask.masked_fill_(~safe_allowed, float("-inf"))
     return mask.unsqueeze(1), query_valid
+
+
+def attention_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    """Compute attention without materializing the score/probability matrices.
+
+    CUDA uses PyTorch's memory-efficient/Flash SDP dispatcher.  The explicit
+    path remains available for CPU and for older torch builds, and deliberately
+    preserves this model's unscaled QK convention (Q/K are RMS-normalized).
+    """
+    if query.is_cuda:
+        try:
+            # SDP applies a 1/sqrt(head_dim) scale by default; multiply Q to
+            # retain the reference implementation's unscaled dot product.
+            return F.scaled_dot_product_attention(
+                query * math.sqrt(head_dim),
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=0.0,
+            )
+        except RuntimeError:
+            # Some CUDA/torch combinations reject additive masks in the fused
+            # kernel. Falling back is correct, albeit slower.
+            pass
+    scores = torch.matmul(query, key.transpose(2, 3)) + mask
+    probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    return torch.matmul(probabilities, value)
 
 
 def repeat_kv(hidden_states: torch.Tensor, repeats: int) -> torch.Tensor:
@@ -151,23 +193,25 @@ class AttentionLayer(nn.Module):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = self.v_norm(value).transpose(1, 2)
+        key_positions = None
         if kv_cache is not None:
             kv_cache.write(layer_id, position_ids, key, value)
             cached = kv_cache.view(layer_id, max_seq_len)
             key, value = cached.key, cached.value
+            key_positions = cached.key_positions
         key = repeat_kv(key, self.num_kv_groups)
         value = repeat_kv(value, self.num_kv_groups)
-        scores = torch.matmul(query, key.transpose(2, 3))
         mask, query_valid = make_attention_mask(
             positions=position_ids,
             sequence_lengths=sequence_lengths,
             key_length=key.shape[2],
             layer_type="full_attention",
-            dtype=scores.dtype,
+            dtype=query.dtype,
+            key_positions=key_positions,
         )
-        scores = scores + mask
-        prob = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
-        output = torch.matmul(prob, value).transpose(1, 2).reshape(batch, seq_len, -1)
+        output = attention_forward(
+            query, key, value, mask, self.head_dim
+        ).transpose(1, 2).reshape(batch, seq_len, -1)
         output = output * query_valid.unsqueeze(-1)
         return self.o_proj(output)
 
@@ -252,23 +296,25 @@ class SlidingAttentionLayer(nn.Module):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = self.v_norm(value).transpose(1, 2)
+        key_positions = None
         if kv_cache is not None:
             kv_cache.write(layer_id, position_ids, key, value)
             cached = kv_cache.view(layer_id, max_seq_len)
             key, value = cached.key, cached.value
+            key_positions = cached.key_positions
         key = repeat_kv(key, self.num_kv_groups)
         value = repeat_kv(value, self.num_kv_groups)
-        scores = torch.matmul(query, key.transpose(2, 3))
         mask, query_valid = make_attention_mask(
             positions=position_ids,
             sequence_lengths=sequence_lengths,
             key_length=key.shape[2],
             layer_type="sliding_attention",
-            dtype=scores.dtype,
+            dtype=query.dtype,
             sliding_window=self.sliding_window,
+            key_positions=key_positions,
         )
-        scores = scores + mask
-        prob = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
-        output = torch.matmul(prob, value).transpose(1, 2).reshape(batch, seq_len, -1)
+        output = attention_forward(
+            query, key, value, mask, self.head_dim
+        ).transpose(1, 2).reshape(batch, seq_len, -1)
         output = output * query_valid.unsqueeze(-1)
         return self.o_proj(output)
