@@ -150,10 +150,11 @@ def quantize_weight_gptq(
         padded_hessian.diagonal()[in_features:] = 1.0
         hessian = padded_hessian
 
+    eps = torch.finfo(torch.float32).eps
     diagonal = torch.diagonal(hessian).clone()
     if not bool(torch.isfinite(diagonal).all()):
         raise ValueError("activation Hessian contains non-finite diagonal entries")
-    dead = diagonal <= torch.finfo(torch.float32).eps
+    dead = diagonal <= eps
     if padded_in_features != in_features:
         dead[in_features:] = True
     dead_columns = int(dead.sum().item())
@@ -216,7 +217,6 @@ def quantize_weight_gptq(
     # propagated through H^{-1}; block_size bounds the temporary correction
     # matrix kept in memory.
     predicted_loss = torch.zeros((), device=device, dtype=torch.float64)
-    eps = torch.finfo(torch.float32).eps
     for block_start in range(0, padded_in_features, block_size):
         block_end = min(block_start + block_size, padded_in_features)
         block_error = torch.empty(
