@@ -137,11 +137,25 @@ def quantize_weight_gptq(
     tokens = calibration.shape[0]
     hessian = calibration.transpose(0, 1).matmul(calibration) / float(max(tokens, 1))
     del calibration
+    if padded_in_features != in_features:
+        # Padding columns have no calibration activation. Extend H with
+        # independent unit diagonal entries so its inverse matches the padded
+        # weight layout used by the block propagation below.
+        padded_hessian = torch.zeros(
+            (padded_in_features, padded_in_features),
+            device=device,
+            dtype=torch.float32,
+        )
+        padded_hessian[:in_features, :in_features] = hessian
+        padded_hessian.diagonal()[in_features:] = 1.0
+        hessian = padded_hessian
 
     diagonal = torch.diagonal(hessian).clone()
     if not bool(torch.isfinite(diagonal).all()):
         raise ValueError("activation Hessian contains non-finite diagonal entries")
     dead = diagonal <= torch.finfo(torch.float32).eps
+    if padded_in_features != in_features:
+        dead[in_features:] = True
     dead_columns = int(dead.sum().item())
     if dead_columns:
         # Make dead features independent so the factorization stays valid even
