@@ -108,9 +108,12 @@ class InferenceEngine:
             mode="prefill",
         )
         with measure_operation(self.device, self.config.synchronize_metrics) as metrics:
-            logits = self.model(model_input, self.cache)
-        batch_indices = torch.arange(batch_size, device=self.device)
-        next_logits = logits[batch_indices, sequence_lengths - 1]
+            logits = self.model(
+                model_input,
+                self.cache,
+                logits_positions=sequence_lengths - 1,
+            )
+        next_logits = logits
         return PrefillOutput(
             next_logits,
             sequence_lengths.clone(),

@@ -153,6 +153,7 @@ class Gemma4ForCausalLM(nn.Module):
         model_input: Batch | torch.Tensor,
         kv_cache: KVCache | None = None,
         logits_to_keep: int = 0,
+        logits_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if isinstance(model_input, torch.Tensor):
             input_ids = model_input
@@ -185,7 +186,14 @@ class Gemma4ForCausalLM(nn.Module):
         if kv_cache is not None:
             kv_cache.commit(sequence_lengths)
         hidden_states = self.norm(hidden_states)
-        if logits_to_keep:
+        if logits_positions is not None:
+            if logits_positions.ndim != 1 or logits_positions.shape[0] != hidden_states.shape[0]:
+                raise ValueError("logits_positions must have shape [batch]")
+            batch_indices = torch.arange(
+                hidden_states.shape[0], device=hidden_states.device
+            )
+            hidden_states = hidden_states[batch_indices, logits_positions]
+        elif logits_to_keep:
             hidden_states = hidden_states[:, -logits_to_keep:]
         logits = F.linear(hidden_states, self.embed_tokens.weight)
         if self.config.final_logit_softcapping is not None:
