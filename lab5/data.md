@@ -53,4 +53,4 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
 
 集群验证结果（H800 MIG 1g.10gb，作业 186041）：GPTQ 成功量化 328 个 Linear 模块，峰值主机内存约 5.66 GiB；公开质量集 INT4 mean_nll=2.4259347128，BF16 mean_nll=2.3084555301，因此 delta_nll=0.1174791827，满足硬门槛 delta_nll < 0.16。
 
-小规模性能集（performance_small.jsonl）使用 batch 1 完成 4 个请求、生成 60 tokens，elapsed_s=84.1439217550，generated_tokens_per_s=0.7130639831。batch 4 在 10 GiB MIG 上出现 OOM，因此最终默认 batch 保守设置为 1；性能评测可在集群上显式尝试 batch 2。
+小规模性能集（performance_small.jsonl）使用 batch 1 完成 4 个请求、生成 60 tokens，elapsed_s=84.1439217550，generated_tokens_per_s=0.7130639831。batch 4 在 10 GiB MIG 上出现 OOM，因此最终默认 batch 保守设置为 1；性能评测推荐显式使用 batch 2；在当前实现和公开性能集上 batch 4 仍会 OOM。
