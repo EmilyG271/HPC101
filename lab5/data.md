@@ -20,7 +20,7 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
 
 ## 2. 量化配置
 
-- 算法：GPTQ，W4A16，group_size=128，对称量化，scale 为 FP16。
+- 算法：GPTQ，W4A16，group_size=128，非对称量化，scale 为 FP16。
 - 校准集：datasets/calibration-256.jsonl。
 - 默认校准：256 条样本、micro batch 1、最多 4096 tokens。
 - GPTQ：Hessian X^T X / N，对角阻尼 damp_percent=0.01，误差按逆 Hessian 顺序传播，block_size=128。
@@ -36,8 +36,9 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
 | 已完成 | GPTQ INT4 asymmetric + static batch 1 | 84.1439217550（performance_small，4 请求，60 token） | reference INT4 推理 |
 | 已完成 | GPTQ + SDPA/Flash dispatch | 包含在上行结果 | CUDA 使用 scaled_dot_product_attention |
 | 已完成 | GPTQ + ring KV cache | 包含在上行结果 | sliding-attention 仅保留窗口 |
-| 待测 | performance_public + batch 1 | — | 公开性能集建议在最终环境复测 |
-| 失败记录 | batch 4 | OOM | 10 GiB MIG 在 prefill 申请额外 512 MiB 时失败 |
+| 已完成 | performance_public + batch 1 | 153.8663635399（5 请求，113 token） | 公开性能集，成功完成 |
+| 已完成 | performance_public + batch 2 | 133.7539581680（5 请求，113 token） | 当前最佳，较 batch 1 快 13.1% |
+| 失败记录 | performance_public + batch 4 | OOM | 10 GiB MIG 在 MLP 输出拼接阶段申请约 176 MiB 时失败 |
 
 ## 4. 运行命令
 
@@ -53,4 +54,4 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
 
 集群验证结果（H800 MIG 1g.10gb，作业 186041）：GPTQ 成功量化 328 个 Linear 模块，峰值主机内存约 5.66 GiB；公开质量集 INT4 mean_nll=2.4259347128，BF16 mean_nll=2.3084555301，因此 delta_nll=0.1174791827，满足硬门槛 delta_nll < 0.16。
 
-小规模性能集（performance_small.jsonl）使用 batch 1 完成 4 个请求、生成 60 tokens，elapsed_s=84.1439217550，generated_tokens_per_s=0.7130639831。batch 4 在 10 GiB MIG 上出现 OOM，因此最终默认 batch 保守设置为 1；性能评测推荐显式使用 batch 2；在当前实现和公开性能集上 batch 4 仍会 OOM。
+小规模性能集（performance_small.jsonl）使用 batch 1 完成 4 个请求、生成 60 tokens，elapsed_s=84.1439217550，generated_tokens_per_s=0.7130639831。公开性能集使用 batch 1 完成 5 个请求、生成 113 tokens，elapsed_s=153.8663635399；batch 2 的 elapsed_s=133.7539581680，是当前最佳结果。batch 4 在 10 GiB MIG 上仍然 OOM，因此最终默认 batch 保守设置为 1；OJ 性能命令建议显式使用 batch 2。
