@@ -148,10 +148,33 @@ class QuantizedLinear(nn.Module):
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        # 参考实现允许在单次 forward 内生成高精度临时权重，但不会把完整
-        # FP16/BF16 权重持久保存在 module 中。融合 kernel 可替换这一过程。
-        weight = dequantize_weight(self.quantized_weight(), dtype=inputs.dtype)
-        return F.linear(inputs, weight, self.bias)
+        # Decode the packed weight in output-row tiles. The old reference path
+        # materialized a full BF16 matrix for every Linear; on the 10-GiB MIG
+        # slice a single large MLP projection could then fail despite the INT4
+        # checkpoint itself fitting comfortably.
+        tile_rows = 256 if inputs.is_cuda else self.out_features
+        if tile_rows >= self.out_features:
+            weight = dequantize_weight(self.quantized_weight(), dtype=inputs.dtype)
+            return F.linear(inputs, weight, self.bias)
+
+        outputs = []
+        for start in range(0, self.out_features, tile_rows):
+            end = min(start + tile_rows, self.out_features)
+            tile = QuantizedWeight(
+                qweight=self.qweight[start:end],
+                scales=self.scales[start:end],
+                zeros=None if self.zeros is None else self.zeros[start:end],
+                original_shape=(end - start, self.in_features),
+                padded_shape=(end - start, self.padded_in_features),
+                bits=4,
+                group_size=self.group_size,
+                symmetric=self.symmetric,
+                packing="uint8_little_nibble",
+            )
+            weight = dequantize_weight(tile, dtype=inputs.dtype)
+            bias = None if self.bias is None else self.bias[start:end]
+            outputs.append(F.linear(inputs, weight, bias))
+        return torch.cat(outputs, dim=-1)
 
 
 class QuantizedLinearFactory:

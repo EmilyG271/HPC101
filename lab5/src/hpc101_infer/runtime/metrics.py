@@ -36,4 +36,3 @@ def measure_operation(device: torch.device, synchronize_cuda: bool):
         else:
             metrics.peak_allocated_bytes = 0
             metrics.peak_reserved_bytes = 0
-        return metrics
