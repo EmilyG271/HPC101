@@ -11,6 +11,11 @@ from torch.nn import functional as F
 from hpc101_infer.quantization.packing import dequantize_weight
 from hpc101_infer.quantization.types import QuantizedModuleManifest, QuantizedWeight
 
+try:
+    from hpc101_infer.runtime.triton_kernels import int4_linear
+except (ImportError, RuntimeError):
+    int4_linear = None
+
 
 class LinearFactory(Protocol):
     def create(
@@ -148,6 +153,31 @@ class QuantizedLinear(nn.Module):
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # The CUDA path fuses nibble decode, per-group scale/zero-point
+        # application, and GEMM in one Triton launch. This avoids both the
+        # Python loop and the temporary BF16 weight matrix used by the fallback.
+        # Fused decode is the high-value case. Large prefill GEMMs are left to
+        # cuBLAS through the tiled fallback, which is faster than the generic
+        # Triton kernel for M > 32 and avoids compiling shape-specific variants.
+        if (
+            int4_linear is not None
+            and inputs.is_cuda
+            and inputs.dtype in (torch.float16, torch.bfloat16)
+            and inputs.numel() // inputs.shape[-1] <= 32
+        ):
+            return int4_linear(
+                inputs,
+                self.qweight,
+                self.scales,
+                self.zeros,
+                self.bias,
+                self.in_features,
+                self.out_features,
+                self.group_size,
+                self.padded_in_features,
+                self.symmetric,
+            )
+
         # Decode the packed weight in output-row tiles. The old reference path
         # materialized a full BF16 matrix for every Linear; on the 10-GiB MIG
         # slice a single large MLP projection could then fail despite the INT4

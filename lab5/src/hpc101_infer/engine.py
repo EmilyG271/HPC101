@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from hpc101_infer.config import EngineConfig
 from hpc101_infer.models.gemma4 import Gemma4ForCausalLM
 from hpc101_infer.models.loader import load_gemma4
+from hpc101_infer.layers.linear import QuantizedLinear
 from hpc101_infer.runtime.batch import Batch
 from hpc101_infer.runtime.kv_cache import KVCache
 from hpc101_infer.runtime.metrics import measure_operation
@@ -68,6 +69,20 @@ class InferenceEngine:
             max_position_embeddings=config.max_sequence_length,
             linear_backend=config.linear_backend,
         )
+        # Compile the fused INT4 decode kernel before the queue timer starts.
+        # Triton compilation is a one-time cost and must not be charged to the
+        # end-to-end request latency measured by run_generation_queue.py.
+        if config.device.startswith("cuda") and config.linear_backend == "int4_reference":
+            for module in model.modules():
+                if isinstance(module, QuantizedLinear):
+                    with torch.inference_mode():
+                        warmup = torch.zeros(
+                            (1, module.in_features),
+                            device=config.device,
+                            dtype=config.dtype,
+                        )
+                        module(warmup)
+                    break
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         return cls(model, config, tokenizer)
 
