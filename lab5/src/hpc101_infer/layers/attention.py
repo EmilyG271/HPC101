@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from torch import nn
@@ -13,6 +14,15 @@ from hpc101_infer.layers.norm import RMSNorm
 from hpc101_infer.layers.rotary import RotaryEmbedding
 from hpc101_infer.models.config import RotaryConfig
 from hpc101_infer.runtime.kv_cache import KVCache
+
+
+_DEBUG_SDPA = os.environ.get("HPC101_ATTENTION_LOG", "0") == "1"
+_ATTENTION_STATS = {"sdpa": 0, "eager": 0, "sdpa_fallback": 0}
+
+
+def attention_backend_stats() -> dict[str, int]:
+    """Return optional attention backend counters for cluster diagnostics."""
+    return dict(_ATTENTION_STATS)
 
 
 def make_causal_mask(
@@ -79,21 +89,31 @@ def attention_forward(
     path remains available for CPU and for older torch builds, and deliberately
     preserves this model's unscaled QK convention (Q/K are RMS-normalized).
     """
-    if query.is_cuda:
+    # Additive/padded masks for long prefill sequences can force the fused
+    # dispatcher to request a large temporary workspace. Restrict SDPA to the
+    # decode-shaped case, where Q is at most one/two tokens and the memory-
+    # efficient CUDA kernel is reliably selected.
+    if query.is_cuda and query.shape[2] <= 32:
         try:
             # SDP applies a 1/sqrt(head_dim) scale by default; multiply Q to
             # retain the reference implementation's unscaled dot product.
-            return F.scaled_dot_product_attention(
+            output = F.scaled_dot_product_attention(
                 query * math.sqrt(head_dim),
                 key,
                 value,
                 attn_mask=mask,
                 dropout_p=0.0,
             )
+            if _DEBUG_SDPA:
+                _ATTENTION_STATS["sdpa"] += 1
+            return output
         except RuntimeError:
             # Some CUDA/torch combinations reject additive masks in the fused
             # kernel. Falling back is correct, albeit slower.
-            pass
+            if _DEBUG_SDPA:
+                _ATTENTION_STATS["sdpa_fallback"] += 1
+    if _DEBUG_SDPA:
+        _ATTENTION_STATS["eager"] += 1
     scores = torch.matmul(query, key.transpose(2, 3)) + mask
     probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
     return torch.matmul(probabilities, value)
