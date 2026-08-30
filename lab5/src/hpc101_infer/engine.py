@@ -72,7 +72,7 @@ class InferenceEngine:
         # Compile the fused INT4 decode kernel before the queue timer starts.
         # Triton compilation is a one-time cost and must not be charged to the
         # end-to-end request latency measured by run_generation_queue.py.
-        if config.device.startswith("cuda") and config.linear_backend == "int4_reference":
+        if config.device.startswith("cuda"):
             for module in model.modules():
                 if isinstance(module, QuantizedLinear):
                     with torch.inference_mode():

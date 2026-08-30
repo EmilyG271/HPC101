@@ -36,9 +36,11 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
 | 已完成 | GPTQ INT4 asymmetric + static batch 1 | 84.1439217550（performance_small，4 请求，60 token） | reference INT4 推理 |
 | 已完成 | GPTQ + SDPA/Flash dispatch | 包含在上行结果 | CUDA 使用 scaled_dot_product_attention |
 | 已完成 | GPTQ + ring KV cache | 包含在上行结果 | sliding-attention 仅保留窗口 |
-| 已完成 | performance_public + batch 1 | 153.8663635399（5 请求，113 token） | 公开性能集，成功完成 |
-| 已完成 | performance_public + batch 2 | 133.7539581680（5 请求，113 token） | 当前最佳，较 batch 1 快 13.1% |
-| 失败记录 | performance_public + batch 4 | OOM | 10 GiB MIG 在 MLP 输出拼接阶段申请约 176 MiB 时失败 |
+| 已完成 | performance_public + batch 1（旧参考实现） | 153.8663635399（5 请求，113 token） | 旧容器数据集/参考路径 |
+| 已完成 | performance_public + batch 2（当前 Triton） | 165.2680295539（10 请求，273 token） | OJ 规模，成功完成，低于 240 s |
+| 诊断 | 当前 attention backend | SDPA 8448 次，eager 0 次，fallback 0 次 | `HPC101_ATTENTION_LOG=1` |
+| 失败记录 | performance_public + batch 3 | CUBLAS_STATUS_EXECUTION_FAILED | 显存压力过高，最终使用 batch 2 |
+| 失败记录 | performance_public + batch 4 | OOM | 10 GiB MIG 显存不足 |
 
 ## 4. 运行命令
 
@@ -54,4 +56,4 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
 
 集群验证结果（H800 MIG 1g.10gb，作业 186041）：GPTQ 成功量化 328 个 Linear 模块，峰值主机内存约 5.66 GiB；公开质量集 INT4 mean_nll=2.4259347128，BF16 mean_nll=2.3084555301，因此 delta_nll=0.1174791827，满足硬门槛 delta_nll < 0.16。
 
-小规模性能集（performance_small.jsonl）使用 batch 1 完成 4 个请求、生成 60 tokens，elapsed_s=84.1439217550，generated_tokens_per_s=0.7130639831。公开性能集使用 batch 1 完成 5 个请求、生成 113 tokens，elapsed_s=153.8663635399；batch 2 的 elapsed_s=133.7539581680，是当前最佳结果。batch 4 在 10 GiB MIG 上仍然 OOM，因此最终默认 batch 保守设置为 1；OJ 性能命令建议显式使用 batch 2。
+小规模性能集（performance_small.jsonl）使用 batch 1 完成 4 个请求、生成 60 tokens，elapsed_s=84.1439217550，generated_tokens_per_s=0.7130639831。当前本地公开性能集包含 10 个请求、生成 273 tokens；使用 Triton decode kernel、SDPA 和 Ring KV Cache 后，batch 2 完成时间为 elapsed_s=165.2680295539，generated_tokens_per_s=1.6518621341，已低于 OJ 的 240 秒零分线。运行期间 attention 诊断显示 SDPA=8448、eager=0、fallback=0，说明 CUDA fused SDPA 实际生效。batch 3 出现 CUBLAS 执行失败，batch 4 OOM，因此最终默认 batch 设置为 2。
