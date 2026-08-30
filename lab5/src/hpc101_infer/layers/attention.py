@@ -89,11 +89,10 @@ def attention_forward(
     path remains available for CPU and for older torch builds, and deliberately
     preserves this model's unscaled QK convention (Q/K are RMS-normalized).
     """
-    # Additive/padded masks for long prefill sequences can force the fused
-    # dispatcher to request a large temporary workspace. Restrict SDPA to the
-    # decode-shaped case, where Q is at most one/two tokens and the memory-
-    # efficient CUDA kernel is reliably selected.
-    if query.is_cuda and query.shape[2] <= 32:
+    # PyTorch's CUDA dispatcher selects the memory-efficient/Flash backend for
+    # the additive mask without materializing the full score matrix. Keep the
+    # eager path below as a compatibility fallback for unsupported devices.
+    if query.is_cuda:
         try:
             # SDP applies a 1/sqrt(head_dim) scale by default; multiply Q to
             # retain the reference implementation's unscaled dot product.
