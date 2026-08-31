@@ -76,12 +76,13 @@ class InferenceEngine:
             for module in model.modules():
                 if isinstance(module, QuantizedLinear):
                     with torch.inference_mode():
-                        warmup = torch.zeros(
-                            (1, module.in_features),
-                            device=config.device,
-                            dtype=config.dtype,
-                        )
-                        module(warmup)
+                        for warmup_rows in (1, 2):
+                            warmup = torch.zeros(
+                                (warmup_rows, module.in_features),
+                                device=config.device,
+                                dtype=config.dtype,
+                            )
+                            module(warmup)
                     break
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         return cls(model, config, tokenizer)
