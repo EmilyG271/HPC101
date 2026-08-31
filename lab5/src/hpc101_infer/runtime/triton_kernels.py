@@ -117,7 +117,9 @@ def int4_linear(
     # The 32-row tile keeps the tensor-core dot path efficient on the H800.
     # It also avoids compiling many small-M variants across the variable batch
     # shapes produced by the queue scheduler.
-    block_m = 32
+    # Decode batches of 2-3 waste fewer lanes with a small tile while retaining
+    # the same tensor-core dot path. Larger prefill shapes use 32 rows.
+    block_m = 4 if x.shape[0] <= 4 else 32
     block_n = 128
     grid = lambda meta: (
         triton.cdiv(x.shape[0], meta["BLOCK_M"])

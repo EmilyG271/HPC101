@@ -34,13 +34,14 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
 |---|---|---:|---|
 | 已有参考 | BF16/原始基线 | 参考结果 mean_nll=2.3084555301 | results/bf16-public-quality.json |
 | 已完成 | GPTQ INT4 asymmetric + static batch 1 | 84.1439217550（performance_small，4 请求，60 token） | reference INT4 推理 |
-| 已完成 | GPTQ + SDPA/Flash dispatch | 包含在上行结果 | CUDA 使用 scaled_dot_product_attention |
+| 已完成 | GPTQ + SDPA/Flash dispatch | 包含在上行结果 | CUDA fused SDPA 实际生效 |
 | 已完成 | GPTQ + ring KV cache | 包含在上行结果 | sliding-attention 仅保留窗口 |
 | 已完成 | performance_public + batch 1（旧参考实现） | 153.8663635399（5 请求，113 token） | 旧容器数据集/参考路径 |
-| 已完成 | performance_public + batch 2（当前 Triton） | 165.2680295539（10 请求，273 token） | OJ 规模，成功完成，低于 240 s |
+| 已完成 | performance_public + batch 2（当前 Triton） | 165.2680295539（10 请求，273 token） | OJ 规模旧版本，低于 240 s |
+| 已完成 | performance_public + batch 3 + tiled prefill + BM4 decode | 143.8994022560（10 请求，320 token） | 当前集群固定公开集，低于 240 s |
+| 已完成 | performance_public + batch 3（no-sync） | 144.6073916740（10 请求，320 token） | no-sync 无收益，最终保留同步指标 |
 | 诊断 | 当前 attention backend | SDPA 8448 次，eager 0 次，fallback 0 次 | `HPC101_ATTENTION_LOG=1` |
-| 失败记录 | performance_public + batch 3 | CUBLAS_STATUS_EXECUTION_FAILED | 显存压力过高，最终使用 batch 2 |
-| 失败记录 | performance_public + batch 4 | OOM | 10 GiB MIG 显存不足 |
+| 失败记录 | performance_public + batch 4 | CUBLAS_STATUS_EXECUTION_FAILED / OOM | 10 GiB MIG 显存不足 |
 
 ## 4. 运行命令
 
@@ -52,8 +53,23 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
     python3 scripts/evaluate_quality.py --model "$QUANT_DIR" --dataset datasets/quality_public.jsonl --output results/quality-final.json --linear-backend int4_reference --no-progress
     python3 scripts/run_generation_queue.py --model "$QUANT_DIR" --input datasets/performance_public.jsonl --output results/generation-final.jsonl --summary-output results/generation-final-summary.json --config config.yaml --linear-backend int4_reference --batch-size 1 --max-sequence-length 2048 --no-progress
 
+## 5. Profiler 结果与热点分析
+
+完整模型 profiler 作业曾因模型加载和 profiler 开销超过 10 分钟墙钟而超时；因此使用相同 H800 MIG、相同 INT4 Triton kernel 和 SDPA 的代表性 4096x4096 decode microbenchmark 生成可复现 trace。
+
+Trace 文件：`profiler-trace-20260831/j211544-bjmnq_1.1788139448795138081.pt.trace.json`。
+
+Profiler 运行 10 次 fused INT4 GEMM 与 10 次 SDPA，主要结果：
+
+- `_int4_gemm_kernel`：18.267 ms self CUDA，总 self CUDA 占比 99.14%；
+- cuDNN/Flash SDPA kernel：约 0.143 ms CUDA，总占比约 0.77%；
+- SDPA 没有 fallback，实际使用 fused CUDA attention；
+- host 侧主要开销来自 profiler 同步和 CUDA launch，不是 attention 算子本身。
+
+结论：当前主要热点是 decode 阶段的 INT4 GEMM，而不是 attention。后续优化优先级应是减少 Linear kernel launch 数量、融合相邻 projection 或使用更适合 M=2/3 的 tensor-core tile；不能继续把主要精力放在已经使用 fused SDPA 的 attention 上。
+
 ## 5. 结果
 
 集群验证结果（H800 MIG 1g.10gb，作业 186041）：GPTQ 成功量化 328 个 Linear 模块，峰值主机内存约 5.66 GiB；公开质量集 INT4 mean_nll=2.4259347128，BF16 mean_nll=2.3084555301，因此 delta_nll=0.1174791827，满足硬门槛 delta_nll < 0.16。
 
-小规模性能集（performance_small.jsonl）使用 batch 1 完成 4 个请求、生成 60 tokens，elapsed_s=84.1439217550，generated_tokens_per_s=0.7130639831。当前本地公开性能集包含 10 个请求、生成 273 tokens；使用 Triton decode kernel、SDPA 和 Ring KV Cache 后，batch 2 完成时间为 elapsed_s=165.2680295539，generated_tokens_per_s=1.6518621341，已低于 OJ 的 240 秒零分线。运行期间 attention 诊断显示 SDPA=8448、eager=0、fallback=0，说明 CUDA fused SDPA 实际生效。batch 3 出现 CUBLAS 执行失败，batch 4 OOM，因此最终默认 batch 设置为 2。
+小规模性能集（performance_small.jsonl）使用 batch 1 完成 4 个请求、生成 60 tokens，elapsed_s=84.1439217550，generated_tokens_per_s=0.7130639831。当前本地公开性能集包含 10 个请求、生成 273 tokens；使用 Triton decode kernel、SDPA 和 Ring KV Cache 后，当前代码在 batch 3 完成 10 请求公开集测试，elapsed_s=143.8994022560；batch 4 仍然 OOM，因此最终默认 batch 设置为 3。用户 OJ 版本报告的 273 token 规模预计可进一步低于该公开集的 320 token 结果。
