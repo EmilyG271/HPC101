@@ -76,7 +76,7 @@ class InferenceEngine:
             for module in model.modules():
                 if isinstance(module, QuantizedLinear):
                     with torch.inference_mode():
-                        for warmup_rows in (1, 2):
+                        for warmup_rows in (1,):
                             warmup = torch.zeros(
                                 (warmup_rows, module.in_features),
                                 device=config.device,

@@ -114,11 +114,11 @@ def int4_linear(
     )
     has_zero = not symmetric
     z_ptr = zeros if zeros is not None else qweight
-    # Decode is dominated by M=1/2. A 32-row tile wastes most of the dot
-    # product for those shapes, so specialize the tile height to the actual
-    # active batch. Larger M values use the tensor-core-friendly fallback tile.
-    block_m = 1 if x.shape[0] == 1 else 2 if x.shape[0] <= 2 else 4 if x.shape[0] <= 4 else 32
-    block_n = 128 if out_features >= 4096 else 256
+    # The 32-row tile keeps the tensor-core dot path efficient on the H800.
+    # It also avoids compiling many small-M variants across the variable batch
+    # shapes produced by the queue scheduler.
+    block_m = 32
+    block_n = 128
     grid = lambda meta: (
         triton.cdiv(x.shape[0], meta["BLOCK_M"])
         * triton.cdiv(out_features, meta["BLOCK_N"]),
