@@ -182,12 +182,19 @@ class QuantizedLinear(nn.Module):
         # materialized a full BF16 matrix for every Linear; on the 10-GiB MIG
         # slice a single large MLP projection could then fail despite the INT4
         # checkpoint itself fitting comfortably.
-        tile_rows = 256 if inputs.is_cuda else self.out_features
+        tile_rows = 512 if inputs.is_cuda else self.out_features
         if tile_rows >= self.out_features:
             weight = dequantize_weight(self.quantized_weight(), dtype=inputs.dtype)
             return F.linear(inputs, weight, self.bias)
 
-        outputs = []
+        # Allocate the final output once and copy each tile directly into it.
+        # Building a Python list followed by torch.cat doubles the peak prefill
+        # activation and caused allocator retries for batch 2 on 10-GiB MIG.
+        output = torch.empty(
+            (*inputs.shape[:-1], self.out_features),
+            device=inputs.device,
+            dtype=inputs.dtype,
+        )
         for start in range(0, self.out_features, tile_rows):
             end = min(start + tile_rows, self.out_features)
             tile = QuantizedWeight(
@@ -203,8 +210,8 @@ class QuantizedLinear(nn.Module):
             )
             weight = dequantize_weight(tile, dtype=inputs.dtype)
             bias = None if self.bias is None else self.bias[start:end]
-            outputs.append(F.linear(inputs, weight, bias))
-        return torch.cat(outputs, dim=-1)
+            output[..., start:end].copy_(F.linear(inputs, weight, bias))
+        return output
 
 
 class QuantizedLinearFactory:
