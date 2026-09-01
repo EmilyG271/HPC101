@@ -227,7 +227,7 @@ python3 scripts/run_generation_queue.py \
 | `--max-sequence-length N`                            | 单条请求的 prompt 与生成 token 的最大总长度                                         | `engine.max_sequence_length`，缺省为 `4096`       |
 | `--attention-backend BACKEND`                        | 注意力实现；当前仅支持 `eager`                                                      | `engine.attention_backend`，缺省为 `eager`        |
 | `--linear-backend BACKEND`                           | Linear 实现，可选 `bf16`、`int4_reference`                                          | `engine.linear_backend`，缺省为 `bf16`            |
-| `--scheduler-backend BACKEND`                        | 调度器实现；当前仅支持 `static_batch`                                               | `engine.scheduler_backend`，缺省为 `static_batch` |
+| `--scheduler-backend BACKEND`                        | 调度器实现，可选 `static_batch`、`continuous_batch`                                 | `engine.scheduler_backend`，缺省为 `static_batch` |
 | `--max-new-tokens N`                                 | 请求记录未提供 `max_new_tokens` 时使用的默认生成长度；不能从配置文件读取            | `32`                                              |
 | `--seed N`                                           | 采样随机种子                                                                        | `engine.seed`，缺省为 `0`                         |
 | `--synchronize-metrics` / `--no-synchronize-metrics` | 开启或关闭各指标计时区间前后的设备同步                                              | `engine.synchronize_metrics`，缺省为开启          |

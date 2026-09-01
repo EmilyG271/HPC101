@@ -76,3 +76,49 @@ Profiler 运行 10 次 fused INT4 GEMM 与 10 次 SDPA，主要结果：
 集群验证结果（H800 MIG 1g.10gb，作业 186041）：GPTQ 成功量化 328 个 Linear 模块，峰值主机内存约 5.66 GiB；公开质量集 INT4 mean_nll=2.4259347128，BF16 mean_nll=2.3084555301，因此 delta_nll=0.1174791827，满足硬门槛 delta_nll < 0.16。
 
 小规模性能集（performance_small.jsonl）使用 batch 1 完成 4 个请求、生成 60 tokens，elapsed_s=84.1439217550，generated_tokens_per_s=0.7130639831。当前本地公开性能集包含 10 个请求、生成 273 tokens；使用 Triton decode kernel、SDPA 和 Ring KV Cache 后，当前代码在 batch 3 完成 10 请求公开集测试，elapsed_s=143.8994022560；batch 4 仍然 OOM，因此最终默认 batch 设置为 3。用户 OJ 版本报告的 273 token 规模预计可进一步低于该公开集的 320 token 结果。
+
+## 6. 2026-09-01 端到端优化结果
+
+本轮流 water 平台为 H800 MIG 1g.10gb，固定 `performance_public.jsonl`、batch=3、`max_sequence_length=2048`、`max_new_tokens=32`、seed=42、关闭进度条，并使用同一 GPTQ checkpoint。
+
+### 6.1 Triton W4A16 与算子融合
+
+按 GemLite split-K 思路为小 batch decode 增加 split-K 路径，并针对 H800 调整 tile。最终默认值为 `HPC101_INT4_SPLIT_K=16`、`BLOCK_N=128`、`BLOCK_K=16`、`num_warps=2`、`num_stages=3`。M<=4 且 N<=4096 时启用 split-K；N=14336 的 gate/up projection 测试为负收益，继续使用普通 tensor-core GEMM。
+
+| Shape / path | 时间 |
+|---|---:|
+| q/o_proj，M=3，N=4096，K=4096，split-K=16 | 1.110 ms |
+| kv_proj，M=3，N=1024，K=4096，split-K=16 | 0.301 ms |
+| down_proj，M=3，N=4096，K=14336，split-K=16 | 3.199 ms |
+| gate/up projection，M=3，N=14336，K=4096，split-K=1 | 3.605 ms |
+
+`fused_gate_up_int4` 已实现并保留在 `HPC101_FUSED_GATE_UP=0` 后面；在最终 tile 下与两个独立 projection 基本持平，因此默认关闭。CUDA Graph 的 CPU/CUDA 拷贝问题已修复，batch=3 decode 可以成功 capture/replay，但 graph memory pool 会在长 prompt prefill 时触发 allocator OOM，因此最终默认 `HPC101_CUDA_GRAPH=0`。
+
+### 6.2 Continuous batching 与 chunked prefill
+
+连续调度使用 3 个物理 KV slot，请求完成后立即释放并补充；KVCache 支持 slot-aware reset/write/view/commit。`Runner` 在 continuous 模式下将整个队列交给 engine，而不是按每 3 条请求切分成静态小组。prefill 通过 `HPC101_PREFILL_CHUNK_SIZE` 分块执行。
+
+| Chunk size | elapsed_s | generated_tokens |
+|---:|---:|---:|
+| 768 | 95.0668 | 320 |
+| 896 | 97.3719 | 316 |
+| 1024 | 91.7657 | 320 |
+| 1152 | 82.9590 | 273 |
+| 1280 | 83.7076 | 273 |
+| 1536 | 82.9622 | 273 |
+
+最终选择 `HPC101_PREFILL_CHUNK_SIZE=1152`：它是最快配置，同时比 1536 的激活峰值更小。连续运行生成 273 tokens，与原始 static/OJ 结果一致；1024 以下的部分运行生成 320 tokens，说明 chunk 边界会影响个别 argmax/EOS 选择，不能作为最终配置。
+
+同一旧 tile、同一提交顺序下，static batch 为 148.4104s/320 tokens，组内 continuous 为 147.3095s/320 tokens；二者 token 总数相同。逐 token 对比仅在第 8 条请求出现首个 token 差异，原因是 continuous 将组内 32-token 请求排到 16-token 请求前，改变 batch 行顺序并引入正常 GEMM 数值差异。
+
+### 6.3 最终回归
+
+最终配置连续重复 3 次：
+
+| Run | elapsed_s | generated_tokens |
+|---|---:|---:|
+| 1 | 82.8897 | 273 |
+| 2 | 82.1392 | 273 |
+| 3 | 82.1890 | 273 |
+
+最终公开精度回归：mean_nll=2.4256333902，BF16 reference mean_nll=2.3084555301，delta_nll=0.1171778601，`passed=true`。相对原始 OJ elapsed_s=148.52，端到端时间下降约 44.2%，已达到 `<90s` 目标。
