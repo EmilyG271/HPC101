@@ -1,17 +1,31 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from hpc101_infer.layers.attention import AttentionLayer, SlidingAttentionLayer
-from hpc101_infer.layers.linear import BF16LinearFactory, LinearFactory
+from hpc101_infer.layers.linear import (
+    BF16LinearFactory,
+    LinearFactory,
+    QuantizedLinear,
+)
 from hpc101_infer.layers.norm import RMSNorm
 from hpc101_infer.models.config import Gemma4TextConfig
 from hpc101_infer.runtime.batch import Batch
 from hpc101_infer.runtime.kv_cache import KVCache
+
+
+try:
+    from hpc101_infer.runtime.triton_kernels import fused_gate_up_int4
+except (ImportError, RuntimeError):
+    fused_gate_up_int4 = None
+
+
+_FUSED_GATE_UP_ENABLED = os.environ.get("HPC101_FUSED_GATE_UP", "0") == "1"
 
 
 class MLP(nn.Module):
@@ -44,6 +58,37 @@ class MLP(nn.Module):
             raise ValueError(f"unsupported activation: {config.hidden_activation}")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        decode_rows = hidden_states.numel() // hidden_states.shape[-1]
+        if (
+            _FUSED_GATE_UP_ENABLED
+            and fused_gate_up_int4 is not None
+            and isinstance(self.gate_proj, QuantizedLinear)
+            and isinstance(self.up_proj, QuantizedLinear)
+            and hidden_states.is_cuda
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+            and decode_rows <= 4
+        ):
+            intermediate = fused_gate_up_int4(
+                hidden_states,
+                self.gate_proj.qweight,
+                self.gate_proj.scales,
+                self.gate_proj.zeros,
+                self.up_proj.qweight,
+                self.up_proj.scales,
+                self.up_proj.zeros,
+                self.gate_proj.in_features,
+                self.gate_proj.out_features,
+                self.gate_proj.group_size,
+                self.gate_proj.padded_in_features,
+                self.gate_proj.symmetric,
+                self.up_proj.in_features,
+                self.up_proj.out_features,
+                self.up_proj.group_size,
+                self.up_proj.padded_in_features,
+                self.up_proj.symmetric,
+            )
+            return self.down_proj(intermediate)
+
         return self.down_proj(
             F.gelu(self.gate_proj(hidden_states), approximate="tanh")
             * self.up_proj(hidden_states)
@@ -109,6 +154,7 @@ class DecoderLayer(nn.Module):
         sequence_lengths: torch.Tensor,
         max_seq_len: int,
         kv_cache: KVCache | None,
+        cache_slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn(
@@ -118,6 +164,7 @@ class DecoderLayer(nn.Module):
             max_seq_len,
             self.layer_idx,
             kv_cache,
+            cache_slots,
         )
         hidden_states = residual + self.post_attention_layernorm(hidden_states)
         residual = hidden_states
@@ -155,6 +202,7 @@ class Gemma4ForCausalLM(nn.Module):
         logits_to_keep: int = 0,
         logits_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        cache_slots = None
         if isinstance(model_input, torch.Tensor):
             input_ids = model_input
             position_ids = (
@@ -174,17 +222,21 @@ class Gemma4ForCausalLM(nn.Module):
             position_ids = model_input.positions
             sequence_lengths = model_input.sequence_lengths
             max_seq_len = model_input.curr_max_seq_len
-        hidden_states = self.embed_tokens(input_ids) * torch.tensor(
-            self.embed_scale,
-            device=input_ids.device,
-            dtype=self.embed_tokens.weight.dtype,
-        )
+            cache_slots = model_input.cache_slots
+        # A Python scalar avoids the dynamic CPU-to-CUDA copy that CUDA graph
+        # capture rejects; PyTorch still computes in the embedding dtype.
+        hidden_states = self.embed_tokens(input_ids) * self.embed_scale
         for layer in self.layers:
             hidden_states = layer(
-                hidden_states, position_ids, sequence_lengths, max_seq_len, kv_cache
+                hidden_states,
+                position_ids,
+                sequence_lengths,
+                max_seq_len,
+                kv_cache,
+                cache_slots,
             )
         if kv_cache is not None:
-            kv_cache.commit(sequence_lengths)
+            kv_cache.commit(sequence_lengths, cache_slots)
         hidden_states = self.norm(hidden_states)
         if logits_positions is not None:
             if logits_positions.ndim != 1 or logits_positions.shape[0] != hidden_states.shape[0]:
