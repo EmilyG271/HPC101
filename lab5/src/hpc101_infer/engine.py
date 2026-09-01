@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from time import perf_counter
 from typing import Any
 
@@ -26,6 +27,43 @@ from hpc101_infer.types import (
     RequestMetrics,
     ScoreOutput,
 )
+
+
+class _DecodeCudaGraph:
+    """Static-shape decode graph for one batch capacity."""
+
+    def __init__(self, engine: "InferenceEngine", batch_size: int) -> None:
+        self.batch_size = batch_size
+        self.token_ids = torch.zeros(
+            (batch_size, 1), device=engine.device, dtype=torch.long
+        )
+        self.positions = torch.zeros_like(self.token_ids)
+        self.sequence_lengths = torch.ones(
+            (batch_size,), device=engine.device, dtype=torch.long
+        )
+        self.graph = torch.cuda.CUDAGraph()
+        engine.cache.reset(batch_size)
+        model_input = Batch(
+            input_ids=self.token_ids,
+            positions=self.positions,
+            sequence_lengths=self.sequence_lengths,
+            curr_max_seq_len=engine.config.max_sequence_length,
+            mode="decode",
+        )
+        # Capture directly from the warmed-up model. The captured execution
+        # initializes only the graph's cache addresses; every real prefill later
+        # overwrites those addresses before replay.
+        with torch.cuda.graph(self.graph):
+            self.output = engine.model(
+                model_input, engine.cache, logits_to_keep=1
+            )
+
+    def copy_inputs(
+        self, token_ids: torch.Tensor, positions: torch.Tensor, sequence_lengths: torch.Tensor
+    ) -> None:
+        self.token_ids.copy_(token_ids)
+        self.positions.copy_(positions)
+        self.sequence_lengths.copy_(sequence_lengths)
 
 
 class InferenceEngine:
@@ -55,6 +93,24 @@ class InferenceEngine:
         self.sampler = Sampler(self.device, self.model.config.vocab_size)
         self._batch_size = 0
         torch.manual_seed(config.seed)
+        self._decode_graphs: dict[int, _DecodeCudaGraph] = {}
+        self._cuda_graph_log = os.environ.get("HPC101_CUDA_GRAPH_LOG", "0") == "1"
+        self._cuda_graph_logged = False
+        if self.device.type == "cuda" and any(
+            module.__class__.__name__ == "QuantizedLinear"
+            for module in self.model.modules()
+        ):
+            # Capture the two capacities used by the queue (the configured
+            # maximum and the final partial batch). Fail closed: unsupported
+            # CUDA/Triton combinations retain the ordinary decode path.
+            capacities = {1, config.max_batch_size}
+            for capacity in sorted(capacities):
+                try:
+                    self._decode_graphs[capacity] = _DecodeCudaGraph(self, capacity)
+                except RuntimeError:
+                    self._decode_graphs.clear()
+                    torch.cuda.empty_cache()
+                    break
 
     @classmethod
     def from_pretrained(
@@ -175,8 +231,17 @@ class InferenceEngine:
             curr_max_seq_len=batch_max_length,
             mode="decode",
         )
+        graph = self._decode_graphs.get(self._batch_size)
         with measure_operation(self.device, self.config.synchronize_metrics) as metrics:
-            logits = self.model(model_input, self.cache, logits_to_keep=1)
+            if graph is not None and batch_max_length <= self.config.max_sequence_length:
+                if self._cuda_graph_log and not self._cuda_graph_logged:
+                    print(f"CUDA_GRAPH_REPLAY batch={self._batch_size}", file=__import__("sys").stderr)
+                    self._cuda_graph_logged = True
+                graph.copy_inputs(token_ids, positions, next_lengths)
+                graph.graph.replay()
+                logits = graph.output
+            else:
+                logits = self.model(model_input, self.cache, logits_to_keep=1)
         return DecodeOutput(
             logits[:, -1],
             next_lengths.clone(),
