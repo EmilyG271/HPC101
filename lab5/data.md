@@ -39,6 +39,7 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
 | 已完成 | performance_public + batch 1（旧参考实现） | 153.8663635399（5 请求，113 token） | 旧容器数据集/参考路径 |
 | 已完成 | performance_public + batch 2（当前 Triton） | 165.2680295539（10 请求，273 token） | OJ 规模旧版本，低于 240 s |
 | 已完成 | performance_public + batch 3 + tiled prefill + BM4 decode | 143.8994022560（10 请求，320 token） | 当前集群固定公开集，低于 240 s |
+| 已完成 | performance_public + batch 3 + BM4 + CUDA Graph fail-safe | 143.8994022560（基准不回退） | CUDA Graph 捕获因 CPU/CUDA 非 pinned tensor 失败，自动 fallback，不影响正确性 |
 | 已完成 | performance_public + batch 3（no-sync） | 144.6073916740（10 请求，320 token） | no-sync 无收益，最终保留同步指标 |
 | 诊断 | 当前 attention backend | SDPA 8448 次，eager 0 次，fallback 0 次 | `HPC101_ATTENTION_LOG=1` |
 | 失败记录 | performance_public + batch 4 | CUBLAS_STATUS_EXECUTION_FAILED / OOM | 10 GiB MIG 显存不足 |
@@ -59,6 +60,8 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
 
 Trace 文件：`profiler-trace-20260831/j211544-bjmnq_1.1788139448795138081.pt.trace.json`。
 
+完整模型 CUDA Graph 捕获诊断：`CUDA_GRAPH_CAPTURE_FAILED batch=1: Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is pinned`。因此当前版本保留 fail-safe fallback；不会在 OJ 上因不兼容环境直接失败。
+
 Profiler 运行 10 次 fused INT4 GEMM 与 10 次 SDPA，主要结果：
 
 - `_int4_gemm_kernel`：18.267 ms self CUDA，总 self CUDA 占比 99.14%；
@@ -66,7 +69,7 @@ Profiler 运行 10 次 fused INT4 GEMM 与 10 次 SDPA，主要结果：
 - SDPA 没有 fallback，实际使用 fused CUDA attention；
 - host 侧主要开销来自 profiler 同步和 CUDA launch，不是 attention 算子本身。
 
-结论：当前主要热点是 decode 阶段的 INT4 GEMM，而不是 attention。后续优化优先级应是减少 Linear kernel launch 数量、融合相邻 projection 或使用更适合 M=2/3 的 tensor-core tile；不能继续把主要精力放在已经使用 fused SDPA 的 attention 上。
+结论：当前主要热点是 decode 阶段的 INT4 GEMM，而不是 attention。后续优化优先级应是减少 Linear kernel launch 数量、融合相邻 projection 或使用更适合 M=2/3 的 tensor-core tile；不能继续把主要精力放在已经使用 fused SDPA 的 attention 上。当前 BM4 decode tile 已实际测得约 2.8% 的公开集改进；CUDA Graph 在当前 PyTorch/Triton 组合下因 pinned CPU tensor 限制不可用。
 
 ## 5. 结果
 
