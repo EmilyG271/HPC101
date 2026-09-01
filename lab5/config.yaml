@@ -4,7 +4,7 @@ engine:
   max_batch_size: 3
   scheduler_batch_size: 3
   max_sequence_length: 2048
-  linear_backend: bf16
+  linear_backend: int4_reference
   scheduler_backend: continuous_batch
   seed: 42
   synchronize_metrics: true
