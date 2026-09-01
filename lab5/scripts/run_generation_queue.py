@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scheduler-backend",
-        choices=("static_batch",),
+        choices=("static_batch", "continuous_batch"),
         default="static_batch",
     )
     parser.add_argument("--max-new-tokens", type=int, default=32)

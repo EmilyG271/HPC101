@@ -191,6 +191,7 @@ class AttentionLayer(nn.Module):
         max_seq_len: int,
         layer_id: int,
         kv_cache: KVCache | None = None,
+        cache_slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, seq_len, _ = hidden_states.shape
         # Projection 后先保持 [batch, sequence, heads, head_dim]，应用 RoPE
@@ -214,8 +215,8 @@ class AttentionLayer(nn.Module):
         value = self.v_norm(value).transpose(1, 2)
         key_positions = None
         if kv_cache is not None:
-            kv_cache.write(layer_id, position_ids, key, value)
-            cached = kv_cache.view(layer_id, max_seq_len)
+            kv_cache.write(layer_id, position_ids, key, value, cache_slots)
+            cached = kv_cache.view(layer_id, max_seq_len, cache_slots)
             key, value = cached.key, cached.value
             key_positions = cached.key_positions
         key = repeat_kv(key, self.num_kv_groups)
@@ -294,6 +295,7 @@ class SlidingAttentionLayer(nn.Module):
         max_seq_len: int,
         layer_id: int,
         kv_cache: KVCache | None = None,
+        cache_slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, seq_len, _ = hidden_states.shape
         # Projection 后先保持 [batch, sequence, heads, head_dim]，应用 RoPE
@@ -317,8 +319,8 @@ class SlidingAttentionLayer(nn.Module):
         value = self.v_norm(value).transpose(1, 2)
         key_positions = None
         if kv_cache is not None:
-            kv_cache.write(layer_id, position_ids, key, value)
-            cached = kv_cache.view(layer_id, max_seq_len)
+            kv_cache.write(layer_id, position_ids, key, value, cache_slots)
+            cached = kv_cache.view(layer_id, max_seq_len, cache_slots)
             key, value = cached.key, cached.value
             key_positions = cached.key_positions
         key = repeat_kv(key, self.num_kv_groups)

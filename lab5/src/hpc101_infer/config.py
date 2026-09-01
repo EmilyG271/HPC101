@@ -152,5 +152,7 @@ class EngineConfig:
             raise ValueError("only the eager attention backend is implemented")
         if self.linear_backend not in {"bf16", "int4_reference"}:
             raise ValueError("linear_backend must be bf16 or int4_reference")
-        if self.scheduler_backend != "static_batch":
-            raise ValueError("only the static_batch scheduler is implemented")
+        if self.scheduler_backend not in {"static_batch", "continuous_batch"}:
+            raise ValueError(
+                "scheduler_backend must be static_batch or continuous_batch"
+            )

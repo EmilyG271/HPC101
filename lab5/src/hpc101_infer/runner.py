@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from itertools import count
+import os
 from queue import Empty, Queue
 from threading import Lock
 from typing import Callable, Iterable
@@ -108,12 +109,31 @@ class Runner:
         *,
         on_completed: Callable[[int], None] | None = None,
     ) -> list[GenerationOutput]:
-        handles = []
-        for request in requests:
-            handles.append(self.submit(request))
+        ordered_requests = list(requests)
+        if self.engine.config.scheduler_backend == "continuous_batch":
+            outputs = self.engine.generate(ordered_requests)
+            if on_completed is not None:
+                on_completed(len(outputs))
+            return outputs
+
+        scheduled_indices = list(range(len(ordered_requests)))
+        if (
+            len(ordered_requests) > self.engine.config.scheduler_batch_size
+            and os.environ.get("HPC101_LENGTH_AWARE_SCHEDULING", "1") != "0"
+        ):
+            # Long-output requests first avoids carrying a completed short slot
+            # through many decode iterations in the same static batch.
+            scheduled_indices.sort(
+                key=lambda index: -ordered_requests[index].max_new_tokens,
+            )
+
+        handles: list[RequestHandle | None] = [None] * len(ordered_requests)
+        for index in scheduled_indices:
+            request = ordered_requests[index]
+            handles[index] = self.submit(request)
             if self.pending_count >= self.engine.config.scheduler_batch_size:
                 completed = self.step()
                 if completed and on_completed is not None:
                     on_completed(len(completed))
         self.drain(on_completed=on_completed)
-        return [handle.result() for handle in handles]
+        return [handle.result() for handle in handles if handle is not None]

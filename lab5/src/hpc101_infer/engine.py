@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections import deque
 from time import perf_counter
 from typing import Any
 
@@ -18,7 +19,7 @@ from hpc101_infer.runtime.batch import Batch
 from hpc101_infer.runtime.kv_cache import KVCache
 from hpc101_infer.runtime.metrics import measure_operation
 from hpc101_infer.sampling import Sampler
-from hpc101_infer.scheduler import RequestState, create_scheduler
+from hpc101_infer.scheduler import RequestState, RequestStatus, create_scheduler
 from hpc101_infer.types import (
     DecodeOutput,
     GenerationOutput,
@@ -26,6 +27,11 @@ from hpc101_infer.types import (
     PrefillOutput,
     RequestMetrics,
     ScoreOutput,
+)
+
+
+_PREFILL_CHUNK_SIZE = max(
+    1, int(os.environ.get("HPC101_PREFILL_CHUNK_SIZE", "1152"))
 )
 
 
@@ -50,13 +56,19 @@ class _DecodeCudaGraph:
             curr_max_seq_len=engine.config.max_sequence_length,
             mode="decode",
         )
-        # Capture directly from the warmed-up model. The captured execution
-        # initializes only the graph's cache addresses; every real prefill later
-        # overwrites those addresses before replay.
-        with torch.cuda.graph(self.graph):
-            self.output = engine.model(
-                model_input, engine.cache, logits_to_keep=1
-            )
+        # Warm up every kernel shape on the capture stream's predecessor before
+        # entering capture; this follows PyTorch's CUDA graph checklist.
+        with torch.inference_mode():
+            engine.model(model_input, engine.cache, logits_to_keep=1)
+            torch.cuda.synchronize()
+            engine.cache.reset(batch_size)
+            # Capture directly from the warmed-up model. The captured execution
+            # initializes only the graph's cache addresses; every real prefill
+            # later overwrites those addresses before replay.
+            with torch.cuda.graph(self.graph):
+                self.output = engine.model(
+                    model_input, engine.cache, logits_to_keep=1
+                )
 
     def copy_inputs(
         self, token_ids: torch.Tensor, positions: torch.Tensor, sequence_lengths: torch.Tensor
@@ -96,14 +108,19 @@ class InferenceEngine:
         self._decode_graphs: dict[int, _DecodeCudaGraph] = {}
         self._cuda_graph_log = os.environ.get("HPC101_CUDA_GRAPH_LOG", "0") == "1"
         self._cuda_graph_logged = False
-        if self.device.type == "cuda" and any(
-            module.__class__.__name__ == "QuantizedLinear"
-            for module in self.model.modules()
+        self._cuda_graph_enabled = os.environ.get("HPC101_CUDA_GRAPH", "0") == "1"
+        if (
+            self.device.type == "cuda"
+            and self._cuda_graph_enabled
+            and any(
+                module.__class__.__name__ == "QuantizedLinear"
+                for module in self.model.modules()
+            )
         ):
-            # Capture the two capacities used by the queue (the configured
-            # maximum and the final partial batch). Fail closed: unsupported
-            # CUDA/Triton combinations retain the ordinary decode path.
-            capacities = {1, config.max_batch_size}
+            # Capture only the configured maximum; the final partial batch can
+            # use the eager path. A second graph pool costs too much memory on
+            # the 10-GiB MIG slice during long-prompt prefill.
+            capacities = {config.max_batch_size}
             for capacity in sorted(capacities):
                 try:
                     self._decode_graphs[capacity] = _DecodeCudaGraph(self, capacity)
@@ -290,11 +307,201 @@ class InferenceEngine:
             padded[row, : len(tokens)] = torch.tensor(tokens, device=self.device)
         return padded, encoded
 
+    @staticmethod
+    def _apply_continuous_tokens(
+        states: list[RequestState],
+        state_indices: list[int],
+        token_ids: list[int],
+        default_stop_token_ids: tuple[int, ...],
+    ) -> None:
+        for state_index, token_id in zip(state_indices, token_ids, strict=True):
+            state = states[state_index]
+            if state.status is not RequestStatus.PREFILLING:
+                state.status = RequestStatus.PREFILLING
+            state.output_token_ids.append(token_id)
+            stop_token_ids = (
+                default_stop_token_ids
+                if state.request.stop_token_ids is None
+                else state.request.stop_token_ids
+            )
+            if token_id in stop_token_ids:
+                state.status = RequestStatus.COMPLETED
+                state.finish_reason = "stop"
+            elif len(state.output_token_ids) >= state.request.max_new_tokens:
+                state.status = RequestStatus.COMPLETED
+                state.finish_reason = "length"
+            else:
+                state.status = RequestStatus.DECODING
+
+    def _prefill_continuous(
+        self,
+        states: list[RequestState],
+        entries: list[tuple[int, int]],
+    ) -> tuple[list[int], torch.Tensor, RequestMetrics]:
+        """Prefill new slots in bounded chunks to cap activation memory."""
+        prompt_lengths = {
+            state_index: len(states[state_index].prompt_token_ids)
+            for _, state_index in entries
+        }
+        max_prompt_length = max(prompt_lengths.values())
+        self.cache.reset_slots(
+            torch.tensor(
+                [slot for slot, _ in entries], device=self.device, dtype=torch.long
+            )
+        )
+
+        finished_indices: list[int] = []
+        finished_logits: list[torch.Tensor] = []
+        prefill_latency_s = 0.0
+        peak_allocated_bytes = 0
+        peak_reserved_bytes = 0
+
+        start = 0
+        while start < max_prompt_length:
+            active_entries = [
+                (slot, state_index)
+                for slot, state_index in entries
+                if prompt_lengths[state_index] > start
+            ]
+            if not active_entries:
+                break
+            chunk_length = min(
+                _PREFILL_CHUNK_SIZE,
+                max(
+                    prompt_lengths[state_index] - start
+                    for _, state_index in active_entries
+                ),
+            )
+            end = min(start + chunk_length, max_prompt_length)
+            slot_ids = torch.tensor(
+                [slot for slot, _ in active_entries],
+                device=self.device,
+                dtype=torch.long,
+            )
+            input_ids = torch.full(
+                (len(active_entries), chunk_length),
+                self.model.config.pad_token_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+            sequence_lengths = torch.empty(
+                len(active_entries), dtype=torch.long, device=self.device
+            )
+            logits_positions = torch.empty(
+                len(active_entries), dtype=torch.long, device=self.device
+            )
+            for row, (_, state_index) in enumerate(active_entries):
+                prompt_ids = states[state_index].prompt_token_ids
+                length = prompt_lengths[state_index]
+                take = min(chunk_length, length - start)
+                input_ids[row, :take] = torch.tensor(
+                    prompt_ids[start : start + take], device=self.device
+                )
+                sequence_lengths[row] = min(length, end)
+                logits_positions[row] = min(length, end) - 1 - start
+
+            positions = (
+                start
+                + torch.arange(chunk_length, device=self.device)
+            ).unsqueeze(0).expand(len(active_entries), -1)
+            model_input = Batch(
+                input_ids=input_ids,
+                positions=positions,
+                sequence_lengths=sequence_lengths,
+                curr_max_seq_len=end,
+                mode="prefill",
+                cache_slots=slot_ids,
+            )
+            with measure_operation(
+                self.device, self.config.synchronize_metrics
+            ) as metrics:
+                logits = self.model(
+                    model_input,
+                    self.cache,
+                    logits_positions=logits_positions,
+                )
+            prefill_latency_s += metrics.latency_s
+            peak_allocated_bytes = max(
+                peak_allocated_bytes, metrics.peak_allocated_bytes
+            )
+            peak_reserved_bytes = max(
+                peak_reserved_bytes, metrics.peak_reserved_bytes
+            )
+
+            finish_mask = sequence_lengths >= torch.tensor(
+                [prompt_lengths[state_index] for _, state_index in active_entries],
+                device=self.device,
+                dtype=torch.long,
+            )
+            if bool(finish_mask.any()):
+                finished_logits.append(logits[finish_mask])
+                finished_indices.extend(
+                    state_index
+                    for (_, state_index), finished in zip(
+                        active_entries, finish_mask.tolist(), strict=True
+                    )
+                    if finished
+                )
+            start = end
+
+        if not finished_indices:
+            raise RuntimeError("continuous prefill finished without request logits")
+        logits = torch.cat(finished_logits, dim=0)
+        metrics = RequestMetrics(
+            prefill_latency_s=prefill_latency_s,
+            peak_allocated_bytes=peak_allocated_bytes,
+            peak_reserved_bytes=peak_reserved_bytes,
+        )
+        return finished_indices, logits, metrics
+
+    def _decode_continuous(
+        self,
+        states: list[RequestState],
+        active_slots: list[int],
+        state_indices: list[int],
+    ) -> tuple[torch.Tensor, RequestMetrics]:
+        slot_ids = torch.tensor(active_slots, device=self.device, dtype=torch.long)
+        token_ids = torch.tensor(
+            [
+                states[slots_index].output_token_ids[-1]
+                for slots_index in state_indices
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )[:, None]
+        current_lengths = self.cache.lengths.index_select(0, slot_ids)
+        next_lengths = current_lengths + 1
+        positions = current_lengths[:, None]
+        model_input = Batch(
+            input_ids=token_ids,
+            positions=positions,
+            sequence_lengths=next_lengths,
+            curr_max_seq_len=int(next_lengths.max().item()),
+            mode="decode",
+            cache_slots=slot_ids,
+        )
+        if os.environ.get("HPC101_CONTINUOUS_DEBUG", "0") == "1":
+            print(
+                "CONTINUOUS_DECODE "
+                f"input_ids={tuple(token_ids.shape)} "
+                f"positions={tuple(positions.shape)} "
+                f"lengths={tuple(next_lengths.shape)} "
+                f"slots={tuple(slot_ids.shape)}",
+                file=__import__("sys").stderr,
+            )
+        with measure_operation(
+            self.device, self.config.synchronize_metrics
+        ) as metrics:
+            logits = self.model(model_input, self.cache, logits_to_keep=1)
+        return logits[:, -1], metrics
+
     @torch.inference_mode()
     def generate(self, requests: list[GenerationRequest]) -> list[GenerationOutput]:
         """对一个静态 batch 执行 prefill、采样和逐 token decode。"""
         if not requests:
             return []
+        if self.config.scheduler_backend == "continuous_batch":
+            return self._generate_continuous(requests)
         if len(requests) > self.config.max_batch_size:
             raise ValueError("request batch exceeds max_batch_size")
 
@@ -396,6 +603,148 @@ class InferenceEngine:
                     finish_reason=state.finish_reason,
                     metrics=RequestMetrics(
                         prefill_latency_s=prefill_output.latency_s,
+                        decode_latencies_s=tuple(decode_latencies[index]),
+                        total_latency_s=total_latency,
+                        peak_allocated_bytes=peak_allocated_bytes,
+                        peak_reserved_bytes=peak_reserved_bytes,
+                    ),
+                )
+            )
+        return outputs
+
+    @torch.inference_mode()
+    def _generate_continuous(
+        self, requests: list[GenerationRequest]
+    ) -> list[GenerationOutput]:
+        """Run requests in persistent cache slots and refill them immediately."""
+        _, encoded = self._encode_requests(requests)
+        states = [
+            RequestState(request=request, prompt_token_ids=prompt_token_ids)
+            for request, prompt_token_ids in zip(requests, encoded, strict=True)
+        ]
+        default_stop_token_ids = (self.model.config.eos_token_id,)
+
+        # Long requests first keeps the active batch near the configured slot
+        # capacity for the whole queue, while outputs remain in submission order.
+        waiting = deque(
+            sorted(
+                range(len(states)),
+                key=lambda index: -states[index].request.max_new_tokens,
+            )
+        )
+        slots: list[int | None] = [None] * self.config.max_batch_size
+        free_slots = list(range(self.config.max_batch_size))
+        prefill_latencies = [0.0] * len(states)
+        decode_latencies: list[list[float]] = [[] for _ in states]
+        peak_allocated_bytes = 0
+        peak_reserved_bytes = 0
+
+        self.cache.reset(self.config.max_batch_size)
+        self._batch_size = self.config.max_batch_size
+        started = perf_counter()
+
+        while waiting or any(slot is not None for slot in slots):
+            new_entries: list[tuple[int, int]] = []
+            while free_slots and waiting:
+                state_index = waiting.popleft()
+                state = states[state_index]
+                if state.request.max_new_tokens == 0:
+                    state.status = RequestStatus.COMPLETED
+                    state.finish_reason = "length"
+                    continue
+                slot = free_slots.pop(0)
+                slots[slot] = state_index
+                new_entries.append((slot, state_index))
+
+            if new_entries:
+                state_indices, logits, prefill_metrics = self._prefill_continuous(
+                    states, new_entries
+                )
+                peak_allocated_bytes = max(
+                    peak_allocated_bytes, prefill_metrics.peak_allocated_bytes
+                )
+                peak_reserved_bytes = max(
+                    peak_reserved_bytes, prefill_metrics.peak_reserved_bytes
+                )
+                for state_index in state_indices:
+                    prefill_latencies[state_index] = prefill_metrics.prefill_latency_s
+                sampling_args = self.sampler.prepare(
+                    [states[state_index].request for state_index in state_indices]
+                )
+                next_tokens = self.sampler.sample(logits, sampling_args)
+                self._apply_continuous_tokens(
+                    states,
+                    state_indices,
+                    next_tokens.tolist(),
+                    default_stop_token_ids,
+                )
+                for slot, state_index in new_entries:
+                    if states[state_index].status is RequestStatus.COMPLETED:
+                        slots[slot] = None
+                        free_slots.append(slot)
+                free_slots.sort()
+
+            active_slots = [
+                slot for slot, state_index in enumerate(slots)
+                if state_index is not None
+            ]
+            if not active_slots:
+                continue
+
+            logits, decode_metrics = self._decode_continuous(
+                states,
+                active_slots,
+                [slots[slot] for slot in active_slots],
+            )
+            peak_allocated_bytes = max(
+                peak_allocated_bytes, decode_metrics.peak_allocated_bytes
+            )
+            peak_reserved_bytes = max(
+                peak_reserved_bytes, decode_metrics.peak_reserved_bytes
+            )
+            state_indices = [
+                slots[slot]
+                for slot in active_slots
+                if slots[slot] is not None
+            ]
+            for state_index in state_indices:
+                decode_latencies[state_index].append(decode_metrics.latency_s)
+            sampling_args = self.sampler.prepare(
+                [states[state_index].request for state_index in state_indices]
+            )
+            next_tokens = self.sampler.sample(logits, sampling_args)
+            self._apply_continuous_tokens(
+                states,
+                state_indices,
+                next_tokens.tolist(),
+                default_stop_token_ids,
+            )
+            for slot in active_slots:
+                state_index = slots[slot]
+                if state_index is not None and states[state_index].status is RequestStatus.COMPLETED:
+                    slots[slot] = None
+                    free_slots.append(slot)
+            free_slots.sort()
+
+        total_latency = perf_counter() - started
+        outputs = []
+        for index, state in enumerate(states):
+            text = (
+                ""
+                if self.tokenizer is None
+                else self.tokenizer.decode(
+                    state.output_token_ids, skip_special_tokens=True
+                )
+            )
+            outputs.append(
+                GenerationOutput(
+                    token_ids=state.output_token_ids,
+                    text=text,
+                    prompt_tokens=len(state.prompt_token_ids),
+                    generated_tokens=len(state.output_token_ids),
+                    finish_reason=state.finish_reason,
+                    metrics=RequestMetrics(
+                        prefill_latency_s=prefill_latencies[index],
                         decode_latencies_s=tuple(decode_latencies[index]),
                         total_latency_s=total_latency,
                         peak_allocated_bytes=peak_allocated_bytes,

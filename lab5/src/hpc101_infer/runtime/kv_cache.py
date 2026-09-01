@@ -42,11 +42,21 @@ class LayerKVCache:
         else:
             self.pending_lengths.zero_()
 
+    def reset_slots(self, slot_ids: torch.Tensor) -> None:
+        """Prepare specific physical slots for new requests."""
+        slot_ids = slot_ids.to(device=self.lengths.device, dtype=torch.long)
+        if self.pending_lengths is None:
+            self.pending_lengths = torch.zeros_like(self.lengths)
+        else:
+            self.pending_lengths[slot_ids] = 0
+        self.lengths[slot_ids] = 0
+
     def write(
         self,
         positions: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        slot_ids: torch.Tensor | None = None,
     ) -> None:
         """按绝对 token 位置写入当前层新计算出的 K/V。"""
         batch_size, query_length = positions.shape
@@ -57,28 +67,39 @@ class LayerKVCache:
                 f"invalid key shape {tuple(key.shape)}, expected "
                 f"{expected_prefix + expected_suffix}"
             )
+        if slot_ids is None:
+            slot_ids = torch.arange(batch_size, device=self.key.device)
+        elif slot_ids.shape != (batch_size,):
+            raise ValueError("slot_ids must have shape [batch]")
+        else:
+            slot_ids = slot_ids.to(device=self.key.device, dtype=torch.long)
+
         if self.ring:
             capacity = self.max_sequence_length
-            for batch_idx in range(batch_size):
-                target = positions[batch_idx].remainder(capacity)
-                self.key[batch_idx].index_copy_(1, target, key[batch_idx])
-                self.value[batch_idx].index_copy_(1, target, value[batch_idx])
+            for row_idx in range(batch_size):
+                slot_idx = int(slot_ids[row_idx])
+                target = positions[row_idx].remainder(capacity)
+                self.key[slot_idx].index_copy_(1, target, key[row_idx])
+                self.value[slot_idx].index_copy_(1, target, value[row_idx])
         else:
-            for batch_idx in range(batch_size):
-                target = positions[batch_idx]
-                self.key[batch_idx].index_copy_(1, target, key[batch_idx])
-                self.value[batch_idx].index_copy_(1, target, value[batch_idx])
+            for row_idx in range(batch_size):
+                slot_idx = int(slot_ids[row_idx])
+                target = positions[row_idx]
+                self.key[slot_idx].index_copy_(1, target, key[row_idx])
+                self.value[slot_idx].index_copy_(1, target, value[row_idx])
 
         # ``lengths`` is committed only after all decoder layers finish. Keep a
         # pending upper bound so a ring view is correct during the current
         # forward (including prefill, when committed lengths are still zero).
         assert self.pending_lengths is not None
-        self.pending_lengths[:batch_size] = torch.maximum(
-            self.pending_lengths[:batch_size],
+        self.pending_lengths[slot_ids] = torch.maximum(
+            self.pending_lengths[slot_ids],
             positions.amax(dim=1) + 1,
         )
 
-    def view(self, max_length: int) -> "LayerKVView":
+    def view(
+        self, max_length: int, slot_ids: torch.Tensor | None = None
+    ) -> "LayerKVView":
         """Return a logical chronological view of the current cache.
 
         Ring layers gather only the last window and expose their absolute token
@@ -88,33 +109,53 @@ class LayerKVCache:
         if max_length <= 0:
             raise ValueError("max_length must be positive")
         if not self.ring:
+            if slot_ids is None:
+                return LayerKVView(
+                    key=self.key[: self.batch_size, :, :max_length, :],
+                    value=self.value[: self.batch_size, :, :max_length, :],
+                )
+            slot_ids = slot_ids.to(device=self.key.device, dtype=torch.long)
             return LayerKVView(
-                key=self.key[: self.batch_size, :, :max_length, :],
-                value=self.value[: self.batch_size, :, :max_length, :],
+                key=self.key.index_select(0, slot_ids)[:, :, :max_length, :],
+                value=self.value.index_select(0, slot_ids)[:, :, :max_length, :],
             )
 
         assert self.pending_lengths is not None
+        if slot_ids is None:
+            slot_ids = torch.arange(self.batch_size, device=self.key.device)
+        else:
+            slot_ids = slot_ids.to(device=self.key.device, dtype=torch.long)
         length = min(max_length, self.max_sequence_length)
-        logical_lengths = self.pending_lengths[: self.batch_size]
+        logical_lengths = self.pending_lengths.index_select(0, slot_ids)
+        selected_key = self.key.index_select(0, slot_ids)
+        selected_value = self.value.index_select(0, slot_ids)
         starts = (logical_lengths - length).clamp_min(0)
         positions = starts[:, None] + torch.arange(
             length, device=self.key.device, dtype=torch.long
         )[None, :]
         indices = positions.remainder(self.max_sequence_length)
         gather_index = indices[:, None, :, None].expand(
-            self.batch_size, self.key.shape[1], length, self.key.shape[3]
+            selected_key.shape[0], self.key.shape[1], length, self.key.shape[3]
         )
         return LayerKVView(
-            key=torch.gather(self.key[: self.batch_size], 2, gather_index),
-            value=torch.gather(self.value[: self.batch_size], 2, gather_index),
+            key=torch.gather(selected_key, 2, gather_index),
+            value=torch.gather(selected_value, 2, gather_index),
             key_positions=positions,
         )
 
-    def commit(self, sequence_lengths: torch.Tensor) -> None:
+    def commit(
+        self, sequence_lengths: torch.Tensor, slot_ids: torch.Tensor | None = None
+    ) -> None:
         """在一次模型 forward 完成后提交新的有效序列长度。"""
-        self.lengths[: self.batch_size].copy_(sequence_lengths)
+        if slot_ids is None:
+            slot_ids = torch.arange(self.batch_size, device=self.key.device)
+        else:
+            slot_ids = slot_ids.to(device=self.key.device, dtype=torch.long)
+        self.lengths.index_copy_(0, slot_ids, sequence_lengths.to(self.key.device))
         assert self.pending_lengths is not None
-        self.pending_lengths[: self.batch_size].copy_(sequence_lengths)
+        self.pending_lengths.index_copy_(
+            0, slot_ids, sequence_lengths.to(self.key.device)
+        )
 
 
 @dataclass(frozen=True)
@@ -204,18 +245,27 @@ class KVCache:
         for layer in self.layers:
             layer.reset(batch_size)
 
+    def reset_slots(self, slot_ids: torch.Tensor) -> None:
+        for layer in self.layers:
+            layer.reset_slots(slot_ids)
+
     def write(
         self,
         layer_id: int,
         positions: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        slot_ids: torch.Tensor | None = None,
     ) -> None:
-        self.layers[layer_id].write(positions, key, value)
+        self.layers[layer_id].write(positions, key, value, slot_ids)
 
-    def view(self, layer_id: int, max_length: int) -> LayerKVView:
-        return self.layers[layer_id].view(max_length)
+    def view(
+        self, layer_id: int, max_length: int, slot_ids: torch.Tensor | None = None
+    ) -> LayerKVView:
+        return self.layers[layer_id].view(max_length, slot_ids)
 
-    def commit(self, sequence_lengths: torch.Tensor) -> None:
+    def commit(
+        self, sequence_lengths: torch.Tensor, slot_ids: torch.Tensor | None = None
+    ) -> None:
         for layer in self.layers:
-            layer.commit(sequence_lengths)
+            layer.commit(sequence_lengths, slot_ids)
