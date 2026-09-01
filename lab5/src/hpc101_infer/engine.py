@@ -107,7 +107,12 @@ class InferenceEngine:
             for capacity in sorted(capacities):
                 try:
                     self._decode_graphs[capacity] = _DecodeCudaGraph(self, capacity)
-                except RuntimeError:
+                except RuntimeError as error:
+                    if self._cuda_graph_log:
+                        print(
+                            f"CUDA_GRAPH_CAPTURE_FAILED batch={capacity}: {error!r}",
+                            file=__import__("sys").stderr,
+                        )
                     self._decode_graphs.clear()
                     torch.cuda.empty_cache()
                     break
