@@ -150,3 +150,13 @@ Profiler 运行 10 次 fused INT4 GEMM 与 10 次 SDPA，主要结果：
 | gate/up_proj，N=14336，K=4096 | 3.306 ms | 0.928 ms |
 
 结论：P1 保留 `block_n=4`，并将 `HPC101_INT4_GEMV_BLOCK_K` 默认值设为 1024。该配置已具备进入 P3 group64 重新量化验证的条件。
+
+## 9. 2026-09-02 P3 group64 复验与回退
+
+统一将量化 `group_size` 从 128 调整为 64 并重新量化后，quality gate 明显改善：`delta_nll=0.0895118046`，满足 `<0.16`。
+
+但在固定 `performance_public.jsonl`、batch=3、chunk=1152、`max_sequence_length=2048`、seed=42 下，group64 连续两次生成 `320` tokens，而不是基准的 `273` tokens。进一步将 chunk size 调整为 1024、1280、1536 复测，仍然都是 `320` tokens，说明差异来自量化后的 logits 改变，而非 chunk 边界。
+
+group64 的两次性能结果为 `46.6986442710s` 和 `46.1908905160s`，虽仍低于 60s，但比 group128 的约 40s 慢，且不满足生成 token 数不变的硬性要求。
+
+结论：P3 回退为 `group_size=128`。group64 不作为最终提交配置。
