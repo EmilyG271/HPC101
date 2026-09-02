@@ -160,3 +160,11 @@ Profiler 运行 10 次 fused INT4 GEMM 与 10 次 SDPA，主要结果：
 group64 的两次性能结果为 `46.6986442710s` 和 `46.1908905160s`，虽仍低于 60s，但比 group128 的约 40s 慢，且不满足生成 token 数不变的硬性要求。
 
 结论：P3 回退为 `group_size=128`。group64 不作为最终提交配置。
+
+## 10. 2026-09-03 最终提交决策
+
+最终保留 group128 GPTQ checkpoint 与 P1/P2 推理配置：`continuous_batch`、batch=3、chunk=1152、`HPC101_INT4_BLOCK_N=4`、`HPC101_INT4_GEMV_BLOCK_K=1024`、`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。该配置已有两次连续复现结果：`40.1211638410s` 和 `40.3061733240s`，均为 273 tokens；质量结果 `delta_nll=0.1171786678`，满足 `<0.16`。
+
+P4 的 FP8 KV + batch 4 属于高精度和高显存风险路径。在当前 group128 配置已经稳定低于 60 秒、batch 4 曾在 BF16 KV 下失败的情况下，不将 P4 纳入最终提交，避免为了额外收益引入不可控的 token 数或精度变化。
+
+最终提交目录 `lab5_oj_submission_minimal` 仅包含 `src/` 与 `config.yaml`，且确认 `src/hpc101_infer/quantization/methods/gptq.py` 和 `src/hpc101_infer/runtime/triton_kernels.py` 存在；本地 `python3 -m compileall -q src` 通过。
