@@ -52,7 +52,7 @@ hpc partitions 于 2026-08-28 查询到：lab5 up，空闲 66 cores；lab5 支�
     export QUANT_DIR=$HOME/gemma-4-12b-gptq-w4a16
     python3 scripts/quantize.py --config config.yaml --model "$MODEL_DIR" --output "$QUANT_DIR" --device cuda --verbose
     python3 scripts/evaluate_quality.py --model "$QUANT_DIR" --dataset datasets/quality_public.jsonl --output results/quality-final.json --linear-backend int4_reference --no-progress
-    python3 scripts/run_generation_queue.py --model "$QUANT_DIR" --input datasets/performance_public.jsonl --output results/generation-final.jsonl --summary-output results/generation-final-summary.json --config config.yaml --linear-backend int4_reference --batch-size 1 --max-sequence-length 2048 --no-progress
+    HPC101_PREFILL_CHUNK_SIZE=1152 python3 scripts/run_generation_queue.py --model "$QUANT_DIR" --input datasets/performance_public.jsonl --output results/generation-final.jsonl --summary-output results/generation-final-summary.json --config config.yaml --linear-backend int4_reference --batch-size 3 --max-batch-size 3 --max-sequence-length 2048 --no-progress
 
 ## 5. Profiler 结果与热点分析
 
@@ -122,3 +122,14 @@ Profiler 运行 10 次 fused INT4 GEMM 与 10 次 SDPA，主要结果：
 | 3 | 82.1890 | 273 |
 
 最终公开精度回归：mean_nll=2.4256333902，BF16 reference mean_nll=2.3084555301，delta_nll=0.1171778601，`passed=true`。相对原始 OJ elapsed_s=148.52，端到端时间下降约 44.2%，已达到 `<90s` 目标。
+
+## 7. 2026-09-02 独立复验
+
+按要求在 `h3250102096+lab5+hpc101` 的 H800 MIG 容器中，从当前 GitHub main 对源码打包注入后重新执行量化、精度和性能测试。
+
+- 作业 `227691`：GPTQ 成功量化 328 个 Linear；quality_public mean_nll=2.4256333902，BF16 reference mean_nll=2.3084555301，delta_nll=0.1171778601，仍满足 `<0.16`。同一作业 performance_public 10 请求、273 token、batch=3、max-sequence-length=2048 得到 `elapsed_s=88.1359233300`。
+- 作业 `227774`：在同一环境重新量化后连续运行三次性能测试，得到 `89.0752241500`、`83.0056475240`、`83.0085460020` 秒；稳定态中位数为 `83.0085460020` 秒，平均值为 `85.0298058920` 秒。
+- 稳定态结果与此前记录的 82.1～82.9 秒相差约 1%，小于 5%；首轮 89.08 秒是 cold-start/allocator 波动，重复运行后回落到 83 秒左右。
+- `python3 -m compileall -q src` 通过；入口脚本可启动；量化、精度评测和性能评测均无 Python traceback。
+
+结论：参考方案在当前环境可行且稳定，最终配置应使用 `scheduler_backend=continuous_batch`、`max_batch_size=3`、`scheduler_batch_size=3`、`HPC101_PREFILL_CHUNK_SIZE=1152`。batch=4 仍会显存不足，不建议提交。
