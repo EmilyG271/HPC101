@@ -32,9 +32,132 @@ _BLOCK_N_OVERRIDE = _positive_env_int("HPC101_INT4_BLOCK_N", 128)
 _BLOCK_K_OVERRIDE = _positive_env_int("HPC101_INT4_BLOCK_K", 16)
 _NUM_WARPS_OVERRIDE = _positive_env_int("HPC101_INT4_NUM_WARPS", 2)
 _NUM_STAGES_OVERRIDE = _positive_env_int("HPC101_INT4_NUM_STAGES", 3)
+_GEMV_BLOCK_N_OVERRIDE = _positive_env_int("HPC101_INT4_BLOCK_N", 4)
+_GEMV_BLOCK_K_OVERRIDE = _positive_env_int("HPC101_INT4_GEMV_BLOCK_K", 1024)
+_GEMV_NUM_WARPS_OVERRIDE = _positive_env_int("HPC101_INT4_GEMV_NUM_WARPS", 4)
+_DEQUANT_BLOCK_N_OVERRIDE = _positive_env_int(
+    "HPC101_DEQUANT_BLOCK_N", 64
+)
+_DEQUANT_BLOCK_K_OVERRIDE = _positive_env_int(
+    "HPC101_DEQUANT_BLOCK_K", 64
+)
+_DEQUANT_NUM_WARPS_OVERRIDE = _positive_env_int(
+    "HPC101_DEQUANT_NUM_WARPS", 8
+)
 
 
 if triton is not None:
+
+    @triton.jit
+    def _int4_row_gemv_kernel(
+        x_ptr, q_ptr, s_ptr, z_ptr, bias_ptr, out_ptr,
+        m, n, k, in_features, group_size,
+        stride_xm, stride_xk, stride_qn, stride_qk,
+        stride_sn, stride_sg, stride_om, stride_on,
+        has_zero: tl.constexpr, has_bias: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        grid_n = tl.cdiv(n, BLOCK_N)
+        pid_m = pid // grid_n
+        pid_n = pid % grid_n
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        m_mask = offs_m < m
+        n_mask = offs_n < n
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k0 in range(0, k, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < in_features
+            x = tl.load(
+                x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
+                mask=m_mask[:, None] & k_mask[None, :],
+                other=0.0,
+            )
+            byte_offsets = offs_k // 2
+            q = tl.load(
+                q_ptr + offs_n[:, None] * stride_qn
+                + byte_offsets[None, :] * stride_qk,
+                mask=n_mask[:, None] & k_mask[None, :],
+                other=0,
+            )
+            low = (offs_k[None, :] & 1) == 0
+            code = tl.where(low, q & 0xF, q >> 4).to(tl.float32)
+            group = offs_k // group_size
+            scale = tl.load(
+                s_ptr + offs_n[:, None] * stride_sn + group[None, :] * stride_sg,
+                mask=n_mask[:, None] & k_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            if has_zero:
+                zero = tl.load(
+                    z_ptr + offs_n[:, None] * stride_sn
+                    + group[None, :] * stride_sg,
+                    mask=n_mask[:, None] & k_mask[None, :],
+                    other=0,
+                ).to(tl.float32)
+                weight = (code - zero) * scale
+            else:
+                weight = (code - 8.0) * scale
+            products = x[:, None, :].to(tl.float32) * weight[None, :, :]
+            acc += tl.sum(products, axis=2)
+
+        if has_bias:
+            bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+            acc += bias[None, :]
+        tl.store(
+            out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+            acc,
+            mask=m_mask[:, None] & n_mask[None, :],
+        )
+
+    @triton.jit
+    def _int4_dequant_kernel(
+        q_ptr, s_ptr, z_ptr, out_ptr,
+        n, in_features, group_size, out_stride,
+        stride_qn, stride_qk, stride_sn, stride_sg,
+        has_zero: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        pid_k = tl.program_id(1)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        n_mask = offs_n < n
+        k_mask = offs_k < in_features
+        mask = n_mask[:, None] & k_mask[None, :]
+
+        byte_offsets = offs_k // 2
+        q = tl.load(
+            q_ptr + offs_n[:, None] * stride_qn
+            + byte_offsets[None, :] * stride_qk,
+            mask=mask,
+            other=0,
+        )
+        low = (offs_k[None, :] & 1) == 0
+        code = tl.where(low, q & 0xF, q >> 4).to(tl.float32)
+        group = offs_k // group_size
+        scale = tl.load(
+            s_ptr + offs_n[:, None] * stride_sn + group[None, :] * stride_sg,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        if has_zero:
+            zero = tl.load(
+                z_ptr + offs_n[:, None] * stride_sn + group[None, :] * stride_sg,
+                mask=mask,
+                other=0,
+            ).to(tl.float32)
+            weight = (code - zero) * scale
+        else:
+            weight = (code - 8.0) * scale
+        tl.store(
+            out_ptr + offs_n[:, None] * out_stride + offs_k[None, :],
+            weight,
+            mask=mask,
+        )
 
     @triton.jit
     def _int4_gemm_kernel(
@@ -217,6 +340,32 @@ def int4_linear(
     x = inputs.reshape(-1, in_features).contiguous()
     has_zero = not symmetric
     z_ptr = zeros if zeros is not None else qweight
+    if (
+        os.environ.get("HPC101_INT4_GEMV", "1") != "0"
+        and x.shape[0] <= 4
+    ):
+        output = torch.empty(
+            (x.shape[0], out_features), device=inputs.device, dtype=inputs.dtype
+        )
+        block_n = _GEMV_BLOCK_N_OVERRIDE
+        grid = (
+            triton.cdiv(x.shape[0], 4)
+            * triton.cdiv(out_features, block_n),
+        )
+        _int4_row_gemv_kernel[grid](
+            x, qweight, scales, z_ptr, bias, output,
+            x.shape[0], out_features, padded_in_features, in_features,
+            group_size,
+            x.stride(0), x.stride(1),
+            qweight.stride(0), qweight.stride(1),
+            scales.stride(0), scales.stride(1),
+            output.stride(0), output.stride(1),
+            has_zero=has_zero, has_bias=bias is not None,
+            BLOCK_M=4, BLOCK_N=block_n, BLOCK_K=_GEMV_BLOCK_K_OVERRIDE,
+            num_warps=_GEMV_NUM_WARPS_OVERRIDE,
+        )
+        return output.reshape(*original_shape, out_features)
+
     split_k = _SPLIT_K_OVERRIDE
     if (
         split_k > 1
@@ -280,6 +429,64 @@ def int4_linear(
         num_warps=_NUM_WARPS_OVERRIDE, num_stages=_NUM_STAGES_OVERRIDE,
     )
     return output.reshape(*original_shape, out_features)
+
+
+def dequantize_int4_weight(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    zeros: torch.Tensor | None,
+    out_features: int,
+    in_features: int,
+    group_size: int,
+    padded_in_features: int,
+    symmetric: bool,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize one Linear weight into a caller-owned dense buffer."""
+    if triton is None or tl is None:
+        raise RuntimeError("Triton is not available")
+    if qweight.dtype != torch.uint8 or scales.ndim != 2:
+        raise ValueError("invalid quantized weight tensors")
+    expected = (out_features, in_features)
+    if tuple(output.shape) != expected:
+        raise ValueError("output buffer has incompatible shape")
+    if output.device != qweight.device or output.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        raise ValueError("output buffer must be a CUDA FP16/BF16 tensor")
+    if symmetric and zeros is not None:
+        raise ValueError("symmetric quantization must not provide zeros")
+    if not symmetric and zeros is None:
+        raise ValueError("asymmetric quantization requires zeros")
+
+    has_zero = not symmetric
+    z_ptr = zeros if zeros is not None else qweight
+    block_n = _DEQUANT_BLOCK_N_OVERRIDE
+    block_k = _DEQUANT_BLOCK_K_OVERRIDE
+    grid = (
+        triton.cdiv(out_features, block_n),
+        triton.cdiv(in_features, block_k),
+    )
+    _int4_dequant_kernel[grid](
+        qweight,
+        scales,
+        z_ptr,
+        output,
+        out_features,
+        in_features,
+        group_size,
+        output.stride(0),
+        qweight.stride(0),
+        qweight.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        has_zero=has_zero,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=_DEQUANT_NUM_WARPS_OVERRIDE,
+    )
+    return output
 
 
 def fused_gate_up_int4(

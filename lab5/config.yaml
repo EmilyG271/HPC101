@@ -7,7 +7,7 @@ engine:
   linear_backend: int4_reference
   scheduler_backend: continuous_batch
   seed: 42
-  synchronize_metrics: true
+  synchronize_metrics: false
 
 quantization:
   algorithm: gptq

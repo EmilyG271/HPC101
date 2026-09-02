@@ -249,6 +249,8 @@ def main() -> None:
     parser.add_argument("--block-k", type=int, default=128)
     parser.add_argument("--num-warps", type=int, default=4)
     parser.add_argument("--num-stages", type=int, default=3)
+    parser.add_argument("--gemv-block-k", type=int, default=1024)
+    parser.add_argument("--gemv-num-warps", type=int, default=4)
     parser.add_argument(
         "--shapes",
         nargs="+",
@@ -263,6 +265,9 @@ def main() -> None:
     triton_kernels._BLOCK_K_OVERRIDE = args.block_k
     triton_kernels._NUM_WARPS_OVERRIDE = args.num_warps
     triton_kernels._NUM_STAGES_OVERRIDE = args.num_stages
+    triton_kernels._GEMV_BLOCK_N_OVERRIDE = args.block_n
+    triton_kernels._GEMV_BLOCK_K_OVERRIDE = args.gemv_block_k
+    triton_kernels._GEMV_NUM_WARPS_OVERRIDE = args.gemv_num_warps
     for name, out_features, in_features in SHAPES:
         if name in args.shapes:
             benchmark(

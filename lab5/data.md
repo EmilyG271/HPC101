@@ -133,3 +133,20 @@ Profiler 运行 10 次 fused INT4 GEMM 与 10 次 SDPA，主要结果：
 - `python3 -m compileall -q src` 通过；入口脚本可启动；量化、精度评测和性能评测均无 Python traceback。
 
 结论：参考方案在当前环境可行且稳定，最终配置应使用 `scheduler_backend=continuous_batch`、`max_batch_size=3`、`scheduler_batch_size=3`、`HPC101_PREFILL_CHUNK_SIZE=1152`。batch=4 仍会显存不足，不建议提交。
+
+## 8. 2026-09-02 P1 基础优化与 GEMV 参数复测
+
+在连续批处理、chunk=1152、batch=3 和 `expandable_segments:True` 的基础上，补齐了专用 decode GEMV、prefill 独立 dequant + cuBLAS、全局 dequant buffer 复用，以及计时外的完整 pipeline warmup。GEMV 参数复测发现 `block_n=4` 仍最优，但 `block_k=1024` 明显优于参考方案中的 128。
+
+固定 `performance_public.jsonl`、`max_sequence_length=2048`、`max_new_tokens=32`、seed=42，连续两次端到端结果为 `40.1211638410s` 和 `40.3061733240s`，均为 273 tokens。quality gate 使用新量化的 group128 checkpoint，`delta_nll=0.1171786678`，满足 `<0.16`。
+
+微基准（M=3，`block_n=4`，`num_warps=4`）对比：
+
+| Shape | BLOCK_K=128 | BLOCK_K=1024 |
+|---|---:|---:|
+| q/o_proj，N=4096，K=4096 | 0.965 ms | 0.271 ms |
+| kv_proj，N=1024，K=4096 | 0.255 ms | 0.072 ms |
+| down_proj，N=4096，K=14336 | 3.365 ms | 0.915 ms |
+| gate/up_proj，N=14336，K=4096 | 3.306 ms | 0.928 ms |
+
+结论：P1 保留 `block_n=4`，并将 `HPC101_INT4_GEMV_BLOCK_K` 默认值设为 1024。该配置已具备进入 P3 group64 重新量化验证的条件。

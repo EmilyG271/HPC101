@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Mapping, Protocol
 
 import torch
@@ -12,9 +13,29 @@ from hpc101_infer.quantization.packing import dequantize_weight
 from hpc101_infer.quantization.types import QuantizedModuleManifest, QuantizedWeight
 
 try:
-    from hpc101_infer.runtime.triton_kernels import int4_linear
+    from hpc101_infer.runtime.triton_kernels import (
+        dequantize_int4_weight,
+        int4_linear,
+    )
 except (ImportError, RuntimeError):
     int4_linear = None
+    dequantize_int4_weight = None
+
+
+_DEQUANT_BUFFERS: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+
+
+def _get_dequant_buffer(
+    inputs: torch.Tensor, out_features: int, in_features: int
+) -> torch.Tensor:
+    """Return a persistent flat buffer large enough for the largest Linear."""
+    key = (str(inputs.device), inputs.dtype)
+    required = out_features * in_features
+    buffer = _DEQUANT_BUFFERS.get(key)
+    if buffer is None or buffer.numel() < required:
+        buffer = torch.empty(required, device=inputs.device, dtype=inputs.dtype)
+        _DEQUANT_BUFFERS[key] = buffer
+    return buffer[:required].view(out_features, in_features)
 
 
 class LinearFactory(Protocol):
@@ -153,12 +174,8 @@ class QuantizedLinear(nn.Module):
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        # The CUDA path fuses nibble decode, per-group scale/zero-point
-        # application, and GEMM in one Triton launch. This avoids both the
-        # Python loop and the temporary BF16 weight matrix used by the fallback.
-        # Fused decode is the high-value case. Large prefill GEMMs are left to
-        # cuBLAS through the tiled fallback, which is faster than the generic
-        # Triton kernel for M > 32 and avoids compiling shape-specific variants.
+        # Decode uses a specialized GEMV. Prefill dequantizes once into a
+        # shared dense buffer and leaves the large GEMM to cuBLAS.
         if (
             int4_linear is not None
             and inputs.is_cuda
@@ -177,6 +194,28 @@ class QuantizedLinear(nn.Module):
                 self.padded_in_features,
                 self.symmetric,
             )
+
+        if (
+            dequantize_int4_weight is not None
+            and os.environ.get("HPC101_TRITON_DEQUANT", "1") != "0"
+            and inputs.is_cuda
+            and inputs.dtype in (torch.float16, torch.bfloat16)
+        ):
+            weight = _get_dequant_buffer(
+                inputs, self.out_features, self.in_features
+            )
+            dequantize_int4_weight(
+                self.qweight,
+                self.scales,
+                self.zeros,
+                self.out_features,
+                self.in_features,
+                self.group_size,
+                self.padded_in_features,
+                self.symmetric,
+                weight,
+            )
+            return F.linear(inputs, weight, self.bias)
 
         # Decode the packed weight in output-row tiles. The old reference path
         # materialized a full BF16 matrix for every Linear; on the 10-GiB MIG

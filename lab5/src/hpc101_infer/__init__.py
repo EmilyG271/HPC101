@@ -1,3 +1,9 @@
+import os
+
+# PyTorch reads this setting when CUDA initializes. The package imports
+# submodules immediately below, so this must stay ahead of those imports.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from hpc101_infer.config import EngineConfig
 from hpc101_infer.engine import InferenceEngine
 from hpc101_infer.quantization.config import QuantizationConfig
