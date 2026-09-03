@@ -30,11 +30,6 @@ from hpc101_infer.types import (
 )
 
 
-_PREFILL_CHUNK_SIZE = max(
-    1, int(os.environ.get("HPC101_PREFILL_CHUNK_SIZE", "1152"))
-)
-
-
 class _DecodeCudaGraph:
     """Static-shape decode graph for one batch capacity."""
 
@@ -88,6 +83,17 @@ class InferenceEngine:
         self.config = config
         self.tokenizer = tokenizer
         self.device = torch.device(config.device)
+        # Batch 4 needs a smaller prefill tile to stay inside the 10-GiB MIG;
+        # batch 3 keeps the previously tuned 1152-token tile.
+        default_prefill_chunk = 512 if config.max_batch_size >= 4 else 1152
+        self._prefill_chunk_size = max(
+            1,
+            int(
+                os.environ.get(
+                    "HPC101_PREFILL_CHUNK_SIZE", str(default_prefill_chunk)
+                )
+            ),
+        )
         first_parameter = next(model.parameters())
         if (
             first_parameter.device != self.device
@@ -392,7 +398,7 @@ class InferenceEngine:
             if not active_entries:
                 break
             chunk_length = min(
-                _PREFILL_CHUNK_SIZE,
+                self._prefill_chunk_size,
                 max(
                     prompt_lengths[state_index] - start
                     for _, state_index in active_entries

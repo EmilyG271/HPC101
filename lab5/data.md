@@ -168,3 +168,89 @@ group64 的两次性能结果为 `46.6986442710s` 和 `46.1908905160s`，虽仍�
 P4 的 FP8 KV + batch 4 属于高精度和高显存风险路径。在当前 group128 配置已经稳定低于 60 秒、batch 4 曾在 BF16 KV 下失败的情况下，不将 P4 纳入最终提交，避免为了额外收益引入不可控的 token 数或精度变化。
 
 最终提交目录 `lab5_oj_submission_minimal` 仅包含 `src/` 与 `config.yaml`，且确认 `src/hpc101_infer/quantization/methods/gptq.py` 和 `src/hpc101_infer/runtime/triton_kernels.py` 存在；本地 `python3 -m compileall -q src` 通过。
+
+## 11. 2026-09-03/04 group64 稳定化与 batch4 复测
+
+OJ 复测确认 group64 asymmetric 可以通过质量门槛并稳定生成 320 tokens：
+
+- `deltaNLL=0.07497832704178808`
+- `elapsed_s=49.23140205303207`
+- `generated_tokens=320`
+- Task1=100，Task2=88.97，总分=93.38
+
+因此本阶段取消“必须回到 273 tokens”的回退约束，保留 group64 asymmetric 作为最终精度方案。
+
+### 11.1 GPTQ 稳定化
+
+完成并验证：
+
+- Hessian 对称化；
+- Cholesky 阻尼重试 `1x → 2x → 4x → 8x`；
+- `eigvalsh` 正定修正；
+- 最终 fallback `max(damp * 100, 1.0)`；
+- 元数据记录 `damp_retries`、`effective_damp_percent`、`eigval_correction`；
+- padding、dead columns、rank deficiency、block 等价性、权重 copy/update、设备迁移测试。
+
+集群测试 `3 passed in 3.58s`，本地 `python3 -m compileall -q src tests` 通过。
+
+### 11.2 batch3 参数复测
+
+使用同一 group64 checkpoint、batch=3、seed=42、`max_sequence_length=2048`，交错对照 `DEQUANT_BLOCK_N=64/128`：
+
+| Chunk | N64 均值 | N128 均值 |
+|---:|---:|---:|
+| 1152 | 46.6067s | 46.4378s |
+| 1536 | 46.5630s | 46.3742s |
+
+`DEQUANT_BLOCK_N=128` 在 6/6 次配对中更快，平均收益约 0.2s。`BLOCK_K=128` 与 `BLOCK_N=128` 组合没有额外稳定收益，因此保留 `BLOCK_K=64`。
+
+GEMV 参数复测结论：
+
+- `BLOCK_N=4` 最优；
+- `BLOCK_K=1024` 最优；
+- `num_warps=4` 最优；
+- `HPC101_FUSED_GATE_UP=1` 在 batch3 下无收益。
+
+### 11.3 batch4 独立候选
+
+在 group64 asymmetric、`DEQUANT_BLOCK_N=128`、`expandable_segments:True` 下测试 batch4：
+
+| Chunk | 3 次均值 | generated_tokens | 状态 |
+|---:|---:|---:|---|
+| 512 | 37.9175s | 320 | 通过 |
+| 640 | 39.3105s | 320 | 通过 |
+| 768 | 37.9980s | 320 | 通过 |
+| 1024 | OOM | - | 失败 |
+| 1152 | OOM | - | 失败 |
+
+batch4 + chunk512 是当前最优配置，均值约 `37.92s`，比 batch3 的约 `46.44s` 快约 `8.52s`，且三次 fresh process 均无 OOM/CUBLAS 错误。
+
+`HPC101_FUSED_GATE_UP=1` 在 batch4 + chunk512 下三次结果为 `41.82s`、`41.86s`、`41.58s`，明显劣化，因此保持关闭。
+
+### 11.4 最终配置
+
+最终提交配置更新为：
+
+- `group_size=64`
+- `symmetric=false`
+- `scheduler_backend=continuous_batch`
+- `max_batch_size=4`
+- `scheduler_batch_size=4`
+- `HPC101_PREFILL_CHUNK_SIZE=512`
+- `HPC101_INT4_BLOCK_N=4`
+- `HPC101_INT4_GEMV_BLOCK_K=1024`
+- `HPC101_INT4_GEMV_NUM_WARPS=4`
+- `HPC101_DEQUANT_BLOCK_N=128`
+- `HPC101_DEQUANT_BLOCK_K=64`
+- `HPC101_DEQUANT_NUM_WARPS=8`
+- `HPC101_FUSED_GATE_UP=0`
+
+最终默认配置 fresh-process 回归三次：
+
+| Run | elapsed_s | generated_tokens |
+|---:|---:|---:|
+| 1 | 38.1943 | 320 |
+| 2 | 38.1901 | 320 |
+| 3 | 38.1563 | 320 |
+
+均值 `38.1802s`，无 OOM/CUBLAS 错误；`tests/test_gptq.py` 3 项通过。
