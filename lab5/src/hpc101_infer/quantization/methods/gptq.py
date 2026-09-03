@@ -72,6 +72,77 @@ def _parse_gptq_options(calibration: Mapping[str, Any]) -> GPTQOptions:
     )
 
 
+def _invert_hessian(
+    hessian: torch.Tensor,
+    mean_diagonal: float,
+    damp_percent: float,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Invert a damped Hessian with auditable numerical safeguards."""
+    base_damp = damp_percent * mean_diagonal
+    retries = 0
+
+    for multiplier in (1.0, 2.0, 4.0, 8.0):
+        damping = base_damp * multiplier
+        hessian_try = hessian.clone()
+        hessian_try.diagonal().add_(damping)
+        chol, info = torch.linalg.cholesky_ex(hessian_try, check_errors=False)
+        if int(info.item()) == 0:
+            inverse = torch.cholesky_inverse(chol)
+            inverse = torch.add(inverse, inverse.T).mul_(0.5)
+            if not bool(torch.isfinite(inverse).all()):
+                raise RuntimeError("damped Hessian inverse is non-finite")
+            return inverse, {
+                "damp_retries": retries,
+                "effective_damp_percent": 100.0 * damping / mean_diagonal,
+                "eigval_correction": 0.0,
+            }
+        retries += 1
+
+    # The diagonal can be positive while the matrix is numerically indefinite.
+    # eigvalsh supplies the smallest correction that restores positive
+    # definiteness without guessing another exponential damping sequence.
+    eigenvalues = torch.linalg.eigvalsh(hessian)
+    minimum_eigenvalue = float(eigenvalues[0].item())
+    del eigenvalues
+    if not math.isfinite(minimum_eigenvalue):
+        raise RuntimeError("Hessian eigenvalues are non-finite")
+
+    eigval_correction = 0.0
+    if minimum_eigenvalue < 0.0:
+        eigval_correction = -minimum_eigenvalue + base_damp
+        hessian_try = hessian.clone()
+        hessian_try.diagonal().add_(eigval_correction)
+        chol, info = torch.linalg.cholesky_ex(hessian_try, check_errors=False)
+        if int(info.item()) == 0:
+            inverse = torch.cholesky_inverse(chol)
+            inverse = torch.add(inverse, inverse.T).mul_(0.5)
+            if not bool(torch.isfinite(inverse).all()):
+                raise RuntimeError("corrected Hessian inverse is non-finite")
+            return inverse, {
+                "damp_retries": retries,
+                "effective_damp_percent": 100.0 * eigval_correction / mean_diagonal,
+                "eigval_correction": eigval_correction,
+            }
+
+    fallback_damping = max(base_damp * 100.0, 1.0)
+    hessian_try = hessian.clone()
+    hessian_try.diagonal().add_(fallback_damping)
+    chol, info = torch.linalg.cholesky_ex(hessian_try, check_errors=False)
+    if int(info.item()) != 0:
+        raise RuntimeError(
+            "Hessian remains non-positive-definite after eigvalsh and fallback damping"
+        )
+    inverse = torch.cholesky_inverse(chol)
+    inverse = torch.add(inverse, inverse.T).mul_(0.5)
+    if not bool(torch.isfinite(inverse).all()):
+        raise RuntimeError("fallback Hessian inverse is non-finite")
+    return inverse, {
+        "damp_retries": retries,
+        "effective_damp_percent": 100.0 * fallback_damping / mean_diagonal,
+        "eigval_correction": eigval_correction,
+    }
+
+
 def quantize_weight_gptq(
     weight: torch.Tensor,
     activations: torch.Tensor,
@@ -130,12 +201,13 @@ def quantize_weight_gptq(
     if padded_in_features != in_features:
         work = F.pad(work, (0, padded_in_features - in_features))
 
-    # H = X^T X / N. A damped Cholesky inverse is more stable than explicitly
+    # H = 2 X^T X / N. A damped Cholesky inverse is more stable than explicitly
     # forming a pseudo-inverse for the nearly rank-deficient matrices produced
     # by short calibration sets.
     calibration = activations.detach().to(device=device, dtype=torch.float32)
     tokens = calibration.shape[0]
-    hessian = calibration.transpose(0, 1).matmul(calibration) / float(max(tokens, 1))
+    hessian = calibration.transpose(0, 1).matmul(calibration)
+    hessian = hessian.mul_(2.0 / float(max(tokens, 1)))
     del calibration
     if padded_in_features != in_features:
         # Padding columns have no calibration activation. Extend H with
@@ -154,7 +226,7 @@ def quantize_weight_gptq(
     diagonal = torch.diagonal(hessian).clone()
     if not bool(torch.isfinite(diagonal).all()):
         raise ValueError("activation Hessian contains non-finite diagonal entries")
-    dead = diagonal <= eps
+    dead = diagonal <= 2.0 * eps
     if padded_in_features != in_features:
         dead[in_features:] = True
     dead_columns = int(dead.sum().item())
@@ -169,32 +241,14 @@ def quantize_weight_gptq(
     mean_diagonal = diagonal[~dead].mean() if bool((~dead).any()) else diagonal.mean()
     if not bool(torch.isfinite(mean_diagonal)) or float(mean_diagonal) <= 0.0:
         mean_diagonal = torch.tensor(1.0, device=device, dtype=torch.float32)
-    damping = float(damp_percent) * mean_diagonal
-    hessian.diagonal().add_(damping)
-
-    # Retry with increasing diagonal jitter for pathological calibration data.
-    # Do not materialize an additional dense identity matrix: for the 14,336
-    # input features of Gemma's MLP, that temporary allocation is large enough
-    # to exhaust a 10-GiB MIG slice.
-    hessian_inverse: torch.Tensor | None = None
-    inverse_diagonal: torch.Tensor | None = None
-    for attempt in range(6):
-        if attempt:
-            # Start above FP32 roundoff and grow to a conservative diagonal
-            # regularizer for rank-deficient short calibration sets.
-            extra_jitter = mean_diagonal * (10.0 ** (-3 + attempt))
-            hessian.diagonal().add_(extra_jitter)
-        chol, info = torch.linalg.cholesky_ex(hessian, check_errors=False)
-        if int(info.item()) == 0:
-            hessian_inverse = torch.cholesky_inverse(chol)
-            del chol
-            break
-    if hessian_inverse is None:
-        # A dense pseudo-inverse has an enormous SVD workspace and can OOM even
-        # when the normal GPTQ state fits. Use a diagonal Hessian approximation
-        # as a safe last resort; this keeps the quantizer bounded and still
-        # applies activation-aware per-column weighting.
-        inverse_diagonal = hessian.diagonal().clamp_min(eps).reciprocal()
+    if not bool(torch.isfinite(hessian).all()):
+        raise ValueError("activation Hessian contains non-finite entries")
+    hessian = torch.add(hessian, hessian.T).mul_(0.5)
+    hessian_inverse, inverse_metadata = _invert_hessian(
+        hessian,
+        float(mean_diagonal.item()),
+        damp_percent,
+    )
     del hessian
 
     encoded = torch.empty(
@@ -259,21 +313,18 @@ def quantize_weight_gptq(
                 encoded[:, column] = quantized_code.to(torch.uint8)
                 reconstructed = (quantized_code - zero) * scale
 
-            if hessian_inverse is not None:
-                diagonal_value = hessian_inverse[column, column].clamp_min(eps)
-            else:
-                assert inverse_diagonal is not None
-                diagonal_value = inverse_diagonal[column]
+            diagonal_value = hessian_inverse[column, column].clamp_min(eps)
             error = (work[:, column] - reconstructed) / diagonal_value
             block_error[:, column - block_start] = error
             predicted_loss += error.double().square().sum() * diagonal_value.double()
 
-            if hessian_inverse is not None and column + 1 < block_end:
+            if column + 1 < block_end:
                 work[:, column + 1 : block_end].sub_(
-                    error[:, None] * hessian_inverse[column, column + 1 : block_end][None, :]
+                    error[:, None]
+                    * hessian_inverse[column, column + 1 : block_end][None, :]
                 )
 
-        if hessian_inverse is not None and block_end < padded_in_features:
+        if block_end < padded_in_features:
             work[:, block_end:].sub_(
                 block_error.matmul(hessian_inverse[block_start:block_end, block_end:])
             )
@@ -295,6 +346,7 @@ def quantize_weight_gptq(
         "block_size": block_size,
         "damp_percent": damp_percent,
         "dead_columns": dead_columns,
+        **inverse_metadata,
         "predicted_loss": float(predicted_loss.item()),
     }
     return quantized, metadata
