@@ -256,3 +256,25 @@ batch4 + chunk512 是当前最优配置，均值约 `37.92s`，比 batch3 的约
 均值 `38.1802s`，无 OOM/CUBLAS 错误；`tests/test_gptq.py` 3 项通过。
 
 最终源码在公开质量集上的回归结果：`mean_nll=2.3979673347`，`delta_nll=0.0895118046`，仍满足 `<0.16`。OJ 私有集结果为 `0.0749783270`。
+
+## 12. 2026-09-04 GEMV 参数收尾复测
+
+修正 `scripts/benchmark_int4.py` 后，使微基准支持 `group_size=64`，并将 decode GEMV 的 `BLOCK_N` 与普通 GEMM tile 参数分离。随后在 H800 MIG 上按 M=4 扫描：
+
+```text
+BLOCK_N ∈ {2, 4, 8}
+BLOCK_K ∈ {512, 1024, 2048}
+num_warps ∈ {2, 4}
+```
+
+覆盖 q/o、kv、down、gate/up 四类真实 Linear 形状。`BLOCK_N=4` 明确最优；`BLOCK_N=8` 或 `BLOCK_K=2048` 大幅劣化。唯一疑似候选是 `BLOCK_N=4, BLOCK_K=512, num_warps=2`，四个形状微基准合计约 `2.296 ms`，略优于默认 `BLOCK_N=4, BLOCK_K=1024, num_warps=4` 的约 `2.356 ms`。
+
+随后用 group64 checkpoint、batch4、chunk512、seed=42 做 fresh-process 交错 A/B 回归：
+
+| Run | K512/W2 候选 | K1024/W4 默认 |
+|---:|---:|---:|
+| 1 | 37.9707s | 37.9885s |
+| 2 | 37.6370s | 37.9461s |
+| 3 | 38.0252s | 37.9114s |
+
+两者均生成 `320 tokens`，无 OOM/CUBLAS 错误。候选均值 `37.8777s`，默认均值 `37.9487s`，仅快 `0.071s`（约 0.19%），且第 3 次反向劣化，属于运行噪声级别。按“无明显收益不采用”的规则，保留默认 `HPC101_INT4_GEMV_BLOCK_K=1024` 与 `HPC101_INT4_GEMV_NUM_WARPS=4`；最终提交包运行时代码和配置不变。

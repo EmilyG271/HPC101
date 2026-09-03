@@ -63,12 +63,13 @@ def benchmark(
     in_features: int,
     splits: Sequence[int],
     iterations: int,
+    group_size: int,
 ) -> None:
     device = torch.device("cuda")
     inputs = torch.randn(
         (rows, in_features), device=device, dtype=torch.bfloat16
     )
-    quantized, weight = make_weight(out_features, in_features, 128, device)
+    quantized, weight = make_weight(out_features, in_features, group_size, device)
     reference = inputs @ weight.T
 
     for split_k in splits:
@@ -81,8 +82,8 @@ def benchmark(
             None,
             in_features,
             out_features,
-            128,
-            in_features,
+            group_size,
+            quantized.padded_shape[1],
             False,
         )
         max_error = (output.float() - reference.float()).abs().max().item()
@@ -95,8 +96,8 @@ def benchmark(
                 None,
                 in_features,
                 out_features,
-                128,
-                in_features,
+                group_size,
+                quantized.padded_shape[1],
                 False,
             )
         torch.cuda.synchronize()
@@ -112,8 +113,8 @@ def benchmark(
                 None,
                 in_features,
                 out_features,
-                128,
-                in_features,
+                group_size,
+                quantized.padded_shape[1],
                 False,
             )
         end.record()
@@ -162,11 +163,17 @@ def run_gate_up(
     return F.gelu(gate, approximate="tanh") * up
 
 
-def benchmark_gate_up(rows: int, out_features: int, in_features: int, iterations: int) -> None:
+def benchmark_gate_up(
+    rows: int,
+    out_features: int,
+    in_features: int,
+    iterations: int,
+    group_size: int,
+) -> None:
     device = torch.device("cuda")
     inputs = torch.randn((rows, in_features), device=device, dtype=torch.bfloat16)
-    gate, gate_weight = make_weight(out_features, in_features, 128, device)
-    up, up_weight = make_weight(out_features, in_features, 128, device)
+    gate, gate_weight = make_weight(out_features, in_features, group_size, device)
+    up, up_weight = make_weight(out_features, in_features, group_size, device)
     gate_logits = inputs @ gate_weight.T
     up_logits = inputs @ up_weight.T
     reference = F.gelu(gate_logits, approximate="tanh") * up_logits
@@ -181,13 +188,13 @@ def benchmark_gate_up(rows: int, out_features: int, in_features: int, iterations
         up.zeros,
         in_features,
         out_features,
-        128,
-        in_features,
+        gate.group_size,
+        gate.padded_shape[1],
         False,
         in_features,
         out_features,
-        128,
-        in_features,
+        gate.group_size,
+        gate.padded_shape[1],
         False,
     )
     max_error = (fused.float() - reference.float()).abs().max().item()
@@ -204,13 +211,13 @@ def benchmark_gate_up(rows: int, out_features: int, in_features: int, iterations
             up.zeros,
             in_features,
             out_features,
-            128,
-            in_features,
+            gate.group_size,
+            gate.padded_shape[1],
             False,
             in_features,
             out_features,
-            128,
-            in_features,
+            gate.group_size,
+            gate.padded_shape[1],
             False,
         )),
     ):
@@ -249,8 +256,11 @@ def main() -> None:
     parser.add_argument("--block-k", type=int, default=128)
     parser.add_argument("--num-warps", type=int, default=4)
     parser.add_argument("--num-stages", type=int, default=3)
+    parser.add_argument("--gemv-block-n", type=int, default=4)
     parser.add_argument("--gemv-block-k", type=int, default=1024)
     parser.add_argument("--gemv-num-warps", type=int, default=4)
+    parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument("--no-gate-up", action="store_true")
     parser.add_argument(
         "--shapes",
         nargs="+",
@@ -265,7 +275,7 @@ def main() -> None:
     triton_kernels._BLOCK_K_OVERRIDE = args.block_k
     triton_kernels._NUM_WARPS_OVERRIDE = args.num_warps
     triton_kernels._NUM_STAGES_OVERRIDE = args.num_stages
-    triton_kernels._GEMV_BLOCK_N_OVERRIDE = args.block_n
+    triton_kernels._GEMV_BLOCK_N_OVERRIDE = args.gemv_block_n
     triton_kernels._GEMV_BLOCK_K_OVERRIDE = args.gemv_block_k
     triton_kernels._GEMV_NUM_WARPS_OVERRIDE = args.gemv_num_warps
     for name, out_features, in_features in SHAPES:
@@ -277,8 +287,10 @@ def main() -> None:
                 in_features,
                 args.splits,
                 args.iterations,
+                args.group_size,
             )
-    benchmark_gate_up(args.rows, 14336, 4096, args.iterations)
+    if not args.no_gate_up:
+        benchmark_gate_up(args.rows, 14336, 4096, args.iterations, args.group_size)
 
 
 if __name__ == "__main__":
